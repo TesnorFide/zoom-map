@@ -2621,6 +2621,15 @@ function isImageBitmapLike(x) {
 function isSvgDataUrl(src) {
   return typeof src === "string" && src.startsWith("data:image/svg+xml");
 }
+function splitQuotePrefix(line) {
+  var _a, _b;
+  const m = /^(\s*(?:>\s*)+)(.*)$/.exec(line);
+  if (m) return { prefix: (_a = m[1]) != null ? _a : "", rest: (_b = m[2]) != null ? _b : "" };
+  return { prefix: "", rest: line };
+}
+function stripQuotePrefix(line) {
+  return splitQuotePrefix(line).rest;
+}
 function tintSvgMarkupLocal(svg, color) {
   const c = color.trim();
   if (!c) return svg;
@@ -2835,35 +2844,43 @@ var MapInstance = class extends import_obsidian13.Component {
     const cx = Math.min(Math.max(worldX / this.imgW, 0), 1);
     const cy = Math.min(Math.max(worldY / this.imgH, 0), 1);
     const zoom = z;
+    let foundBlock = false;
+    let didChange = false;
     await this.app.vault.process(af, (text) => {
-      var _a;
+      var _a, _b;
       const lines = text.split("\n");
       const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
       if (!blk) return text;
+      foundBlock = true;
+      const blkPrefix = splitQuotePrefix((_a = lines[blk.start]) != null ? _a : "").prefix;
       const content = lines.slice(blk.start + 1, blk.end);
       const keyRe = /^(\s*)view\s*:/;
       let keyIdx = -1;
       let keyIndent = "";
+      let keyPrefix = blkPrefix;
       for (let i = 0; i < content.length; i++) {
-        const m = keyRe.exec(content[i]);
+        const info = splitQuotePrefix(content[i]);
+        const m = keyRe.exec(info.rest);
         if (m) {
           keyIdx = i;
-          keyIndent = (_a = m[1]) != null ? _a : "";
+          keyIndent = (_b = m[1]) != null ? _b : "";
+          keyPrefix = info.prefix || blkPrefix;
           break;
         }
       }
       const viewLines = [
-        `${keyIndent}view:`,
-        `${keyIndent}  zoom: ${zoom.toFixed(4)}`,
-        `${keyIndent}  centerX: ${cx.toFixed(6)}`,
-        `${keyIndent}  centerY: ${cy.toFixed(6)}`
+        `${keyPrefix}${keyIndent}view:`,
+        `${keyPrefix}${keyIndent}  zoom: ${zoom.toFixed(4)}`,
+        `${keyPrefix}${keyIndent}  centerX: ${cx.toFixed(6)}`,
+        `${keyPrefix}${keyIndent}  centerY: ${cy.toFixed(6)}`
       ];
       const isNextTopLevelKey = (ln) => {
-        var _a2, _b;
-        const trimmed = ln.trim();
+        var _a2, _b2;
+        const rest = stripQuotePrefix(ln);
+        const trimmed = rest.trim();
         if (!trimmed) return false;
         if (trimmed.startsWith("#")) return false;
-        const spaces = (_b = (_a2 = /^\s*/.exec(ln)) == null ? void 0 : _a2[0].length) != null ? _b : 0;
+        const spaces = (_b2 = (_a2 = /^\s*/.exec(rest)) == null ? void 0 : _a2[0].length) != null ? _b2 : 0;
         return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.test(trimmed);
       };
       let newContent;
@@ -2877,20 +2894,30 @@ var MapInstance = class extends import_obsidian13.Component {
         ];
       } else {
         const indent = this.detectYamlKeyIndent(content);
+        const pfx = blkPrefix;
         const vLines = [
-          `${indent}view:`,
-          `${indent}  zoom: ${zoom.toFixed(4)}`,
-          `${indent}  centerX: ${cx.toFixed(6)}`,
-          `${indent}  centerY: ${cy.toFixed(6)}`
+          `${pfx}${indent}view:`,
+          `${pfx}${indent}  zoom: ${zoom.toFixed(4)}`,
+          `${pfx}${indent}  centerX: ${cx.toFixed(6)}`,
+          `${pfx}${indent}  centerY: ${cy.toFixed(6)}`
         ];
         newContent = [...content, ...vLines];
       }
+      if (newContent.join("\n") !== content.join("\n")) didChange = true;
       return [
         ...lines.slice(0, blk.start + 1),
         ...newContent,
         ...lines.slice(blk.end)
       ].join("\n");
     });
+    if (!foundBlock) {
+      new import_obsidian13.Notice("Could not locate zoommap block (embedded/callout?).", 3500);
+      return;
+    }
+    if (!didChange) {
+      new import_obsidian13.Notice("Default view unchanged (already up to date).", 2e3);
+      return;
+    }
     new import_obsidian13.Notice("Default view stored in YAML.", 2e3);
   }
   async applyViewEditorResult(cfg) {
@@ -2907,18 +2934,35 @@ var MapInstance = class extends import_obsidian13.Component {
       const plugin = this.plugin;
       return plugin.buildYamlFromViewConfig(pluginCfg);
     };
+    let foundBlock = false;
+    let didChange = false;
     await this.app.vault.process(af, (text) => {
+      var _a;
       const lines = text.split("\n");
       const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
       if (!blk) return text;
+      foundBlock = true;
+      const blkPrefix = splitQuotePrefix((_a = lines[blk.start]) != null ? _a : "").prefix;
       const yaml = buildYaml(cfg);
-      const yamlLines = yaml.split("\n");
+      const yamlLinesRaw = yaml.split("\n");
+      const yamlLines = blkPrefix ? yamlLinesRaw.map((ln) => `${blkPrefix}${ln}`) : yamlLinesRaw;
+      const before = lines.slice(blk.start + 1, blk.end).join("\n");
+      const after = yamlLines.join("\n");
+      if (before !== after) didChange = true;
       return [
         ...lines.slice(0, blk.start + 1),
         ...yamlLines,
         ...lines.slice(blk.end)
       ].join("\n");
     });
+    if (!foundBlock) {
+      new import_obsidian13.Notice("Could not locate zoommap block (embedded/callout?).", 3500);
+      return;
+    }
+    if (!didChange) {
+      new import_obsidian13.Notice("No changes to apply.", 2e3);
+      return;
+    }
     new import_obsidian13.Notice("View updated. Reload the note to see changes.", 2500);
   }
   hasViewportFrame() {
@@ -7630,9 +7674,8 @@ var MapInstance = class extends import_obsidian13.Component {
       const lines = text.split("\n");
       const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
       if (!blk) return false;
-      const content = lines.slice(blk.start + 1, blk.end).join("\n");
       const keyLower = key.toLowerCase();
-      return content.split("\n").some((ln) => ln.trimStart().toLowerCase().startsWith(`${keyLower}:`));
+      return lines.slice(blk.start + 1, blk.end).some((ln) => stripQuotePrefix(ln).trimStart().toLowerCase().startsWith(`${keyLower}:`));
     } catch (e) {
       return false;
     }
@@ -7661,14 +7704,15 @@ var MapInstance = class extends import_obsidian13.Component {
       const keyRe = /^(\s*)image\s*:\s*(.*)$/i;
       const out = content.map((ln) => {
         var _a, _b;
-        const m = keyRe.exec(ln);
+        const info = splitQuotePrefix(ln);
+        const m = keyRe.exec(info.rest);
         if (!m) return ln;
         const indent = (_a = m[1]) != null ? _a : "";
         const rhs = (_b = m[2]) != null ? _b : "";
         const val = stripQuotes(rhs);
         if (val === oldValue) {
           changed = true;
-          return `${indent}image: ${JSON.stringify(newValue)}`;
+          return `${info.prefix}${indent}image: ${JSON.stringify(newValue)}`;
         }
         return ln;
       });
@@ -7930,21 +7974,25 @@ var MapInstance = class extends import_obsidian13.Component {
     const keyRe = new RegExp(`^(\\s*)${key}\\s*:(.*)$`);
     let keyIdx = -1;
     let keyIndent = "";
+    let keyPrefix = "";
     for (let i = 0; i < out.length; i++) {
-      const m = keyRe.exec(out[i]);
+      const info = splitQuotePrefix(out[i]);
+      const m = keyRe.exec(info.rest);
       if (m) {
         keyIdx = i;
         keyIndent = (_a = m[1]) != null ? _a : "";
+        keyPrefix = info.prefix;
         break;
       }
     }
     if (keyIdx < 0) return { changed: false, out };
     const isNextTopLevelKey = (ln) => {
       var _a2, _b2;
-      const trimmed = ln.trim();
+      const rest = stripQuotePrefix(ln);
+      const trimmed = rest.trim();
       if (!trimmed) return false;
       if (trimmed.startsWith("#")) return false;
-      const spaces = (_b2 = (_a2 = /^\s*/.exec(ln)) == null ? void 0 : _a2[0].length) != null ? _b2 : 0;
+      const spaces = (_b2 = (_a2 = /^\s*/.exec(rest)) == null ? void 0 : _a2[0].length) != null ? _b2 : 0;
       return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.exec(trimmed) !== null;
     };
     let regionEnd = keyIdx + 1;
@@ -8002,17 +8050,17 @@ var MapInstance = class extends import_obsidian13.Component {
     ];
     const remainingItems = removed.some((ln) => ln.trimStart().startsWith("-"));
     if (!remainingItems) {
-      nextOut[keyIdx] = `${keyIndent}${key}: []`;
+      nextOut[keyIdx] = `${keyPrefix}${keyIndent}${key}: []`;
     }
     return { changed, out: nextOut };
   }
   findZoommapBlock(lines, approxLine) {
     let result = null;
     for (let i = 0; i < lines.length; i++) {
-      const ln = lines[i].trimStart().toLowerCase();
+      const ln = stripQuotePrefix(lines[i]).trimStart().toLowerCase();
       if (ln.startsWith("```zoommap")) {
         let j = i + 1;
-        while (j < lines.length && !lines[j].trimStart().startsWith("```")) j++;
+        while (j < lines.length && !stripQuotePrefix(lines[j]).trimStart().startsWith("```")) j++;
         if (j >= lines.length) break;
         const block = { start: i, end: j };
         if (typeof approxLine === "number" && i <= approxLine && approxLine <= j) return block;
@@ -8023,18 +8071,21 @@ var MapInstance = class extends import_obsidian13.Component {
     return result;
   }
   patchYamlList(contentLines, key, path, opts) {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     const out = contentLines.slice();
     const keyRe = new RegExp(`^(\\s*)${key}\\s*:(.*)$`);
     let keyIdx = -1;
     let keyIndent = "";
     let after = "";
+    let keyPrefix = "";
     for (let i = 0; i < out.length; i++) {
-      const m = keyRe.exec(out[i]);
+      const info = splitQuotePrefix(out[i]);
+      const m = keyRe.exec(info.rest);
       if (m) {
         keyIdx = i;
         keyIndent = (_a = m[1]) != null ? _a : "";
         after = ((_b = m[2]) != null ? _b : "").trim();
+        keyPrefix = info.prefix;
         break;
       }
     }
@@ -8042,18 +8093,19 @@ var MapInstance = class extends import_obsidian13.Component {
     const nm = (_c = opts == null ? void 0 : opts.name) != null ? _c : "";
     const itemLines = [];
     const itemIndent = `${keyIndent}  `;
-    itemLines.push(`${itemIndent}- path: ${jsonQuoted}`);
-    itemLines.push(`${itemIndent}  name: ${JSON.stringify(nm)}`);
+    itemLines.push(`${keyPrefix}${itemIndent}- path: ${jsonQuoted}`);
+    itemLines.push(`${keyPrefix}${itemIndent}  name: ${JSON.stringify(nm)}`);
     if (keyIdx >= 0) {
-      if (/^\[\s*\]$/.exec(after)) out[keyIdx] = `${keyIndent}${key}:`;
+      if (/^\[\s*\]$/.exec(after)) out[keyIdx] = `${keyPrefix}${keyIndent}${key}:`;
       let insertAt = keyIdx + 1;
       let scan = keyIdx + 1;
       const isNextTopLevelKey = (ln) => {
         var _a2, _b2;
-        const trimmed = ln.trim();
+        const rest = stripQuotePrefix(ln);
+        const trimmed = rest.trim();
         if (!trimmed) return false;
         if (trimmed.startsWith("#")) return false;
-        const spaces = (_b2 = (_a2 = /^\s*/.exec(ln)) == null ? void 0 : _a2[0].length) != null ? _b2 : 0;
+        const spaces = (_b2 = (_a2 = /^\s*/.exec(rest)) == null ? void 0 : _a2[0].length) != null ? _b2 : 0;
         return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.exec(trimmed) !== null;
       };
       while (scan < out.length && !isNextTopLevelKey(out[scan])) scan++;
@@ -8068,15 +8120,18 @@ var MapInstance = class extends import_obsidian13.Component {
       out.splice(insertAt, 0, ...itemLines);
       return { changed: true, out };
     }
+    const blockPrefix = (_d = out.map((ln) => splitQuotePrefix(ln).prefix).find((p) => p.length > 0)) != null ? _d : "";
     const defaultIndent = this.detectYamlKeyIndent(out);
-    out.push(`${defaultIndent}${key}:`);
-    out.push(...itemLines);
+    out.push(`${blockPrefix}${defaultIndent}${key}:`);
+    const itemIndent2 = `${defaultIndent}  `;
+    out.push(`${blockPrefix}${itemIndent2}- path: ${jsonQuoted}`);
+    out.push(`${blockPrefix}${itemIndent2}  name: ${JSON.stringify(nm)}`);
     return { changed: true, out };
   }
   detectYamlKeyIndent(lines) {
     var _a;
     for (const ln of lines) {
-      const m = /^(\s*)[A-Za-z0-9_-]+\s*:/.exec(ln);
+      const m = /^(\s*)[A-Za-z0-9_-]+\s*:/.exec(stripQuotePrefix(ln));
       if (m) return (_a = m[1]) != null ? _a : "";
     }
     return "";
@@ -8907,10 +8962,25 @@ var ZoomMapPlugin = class extends import_obsidian18.Plugin {
           }
         };
         new ViewEditorModal(this.app, initialConfig, (res) => {
+          var _a, _b;
           if (res.action !== "save" || !res.config) return;
           const yaml = this.buildYamlFromViewConfig(res.config);
           const block = "```zoommap\n" + yaml + "\n```\n";
-          editor.replaceRange(block, editor.getCursor());
+          const cur = editor.getCursor();
+          const curLineText = (_a = editor.getLine(cur.line)) != null ? _a : "";
+          const m = /^(\s*(?:>\s*)+)/.exec(curLineText);
+          const quotePrefix = (_b = m == null ? void 0 : m[1]) != null ? _b : "";
+          if (!quotePrefix) {
+            editor.replaceRange(block, cur);
+            return;
+          }
+          const cursorAfterPrefix = cur.ch >= quotePrefix.length;
+          const lines = block.split("\n");
+          const quoted = lines.map((ln, idx) => {
+            if (idx === 0 && cursorAfterPrefix) return ln;
+            return quotePrefix + ln;
+          }).join("\n");
+          editor.replaceRange(quoted, cur);
         }).open();
       }
     });

@@ -410,7 +410,28 @@ export default class ZoomMapPlugin extends Plugin {
         const yaml = this.buildYamlFromViewConfig(res.config);
         const block = "```zoommap\n" + yaml + "\n```\n";
 
-        editor.replaceRange(block, editor.getCursor());
+        // If user inserts inside a callout / blockquote line, prefix all inserted lines
+        // with the same quote prefix ("> ", "> > ", etc.).
+        const cur = editor.getCursor();
+        const curLineText = editor.getLine(cur.line) ?? "";
+        const m = /^(\s*(?:>\s*)+)/.exec(curLineText);
+        const quotePrefix = m?.[1] ?? "";
+
+        if (!quotePrefix) {
+          editor.replaceRange(block, cur);
+          return;
+        }
+
+        const cursorAfterPrefix = cur.ch >= quotePrefix.length;
+        const lines = block.split("\n");
+        const quoted = lines
+          .map((ln, idx) => {
+            if (idx === 0 && cursorAfterPrefix) return ln;
+            return quotePrefix + ln;
+          })
+          .join("\n");
+
+        editor.replaceRange(quoted, cur);
       }).open();
     },
   });

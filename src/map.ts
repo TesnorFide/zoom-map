@@ -199,6 +199,18 @@ function isSvgDataUrl(src: string): boolean {
   return typeof src === "string" && src.startsWith("data:image/svg+xml");
 }
 
+// --- Blockquote / callout helpers (for embedded zoommap blocks) ---
+function splitQuotePrefix(line: string): { prefix: string; rest: string } {
+  // Matches any number of blockquote markers: "> " or "> > " etc.
+  const m = /^(\s*(?:>\s*)+)(.*)$/.exec(line);
+  if (m) return { prefix: m[1] ?? "", rest: m[2] ?? "" };
+  return { prefix: "", rest: line };
+}
+
+function stripQuotePrefix(line: string): string {
+  return splitQuotePrefix(line).rest;
+}
+
 function tintSvgMarkupLocal(svg: string, color: string): string {
   const c = color.trim();
   if (!c) return svg;
@@ -470,38 +482,47 @@ private async saveDefaultViewToYaml(): Promise<void> {
   const cy = Math.min(Math.max(worldY / this.imgH, 0), 1);
 
   const zoom = z;
+    let foundBlock = false;
+    let didChange = false;
 
-  await this.app.vault.process(af, (text) => {
+    await this.app.vault.process(af, (text) => {
     const lines = text.split("\n");
     const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
     if (!blk) return text;
+    foundBlock = true;
+
+    const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
 
     const content = lines.slice(blk.start + 1, blk.end);
     const keyRe = /^(\s*)view\s*:/;
     let keyIdx = -1;
     let keyIndent = "";
+    let keyPrefix = blkPrefix;
 
     for (let i = 0; i < content.length; i++) {
-      const m = keyRe.exec(content[i]);
+      const info = splitQuotePrefix(content[i]);
+      const m = keyRe.exec(info.rest);
       if (m) {
         keyIdx = i;
         keyIndent = m[1] ?? "";
+        keyPrefix = info.prefix || blkPrefix;
         break;
       }
     }
 
     const viewLines = [
-      `${keyIndent}view:`,
-      `${keyIndent}  zoom: ${zoom.toFixed(4)}`,
-      `${keyIndent}  centerX: ${cx.toFixed(6)}`,
-      `${keyIndent}  centerY: ${cy.toFixed(6)}`,
+      `${keyPrefix}${keyIndent}view:`,
+      `${keyPrefix}${keyIndent}  zoom: ${zoom.toFixed(4)}`,
+      `${keyPrefix}${keyIndent}  centerX: ${cx.toFixed(6)}`,
+      `${keyPrefix}${keyIndent}  centerY: ${cy.toFixed(6)}`,
     ];
 
     const isNextTopLevelKey = (ln: string) => {
-      const trimmed = ln.trim();
+      const rest = stripQuotePrefix(ln);
+      const trimmed = rest.trim();
       if (!trimmed) return false;
       if (trimmed.startsWith("#")) return false;
-      const spaces = (/^\s*/.exec(ln))?.[0].length ?? 0;
+      const spaces = (/^\s*/.exec(rest))?.[0].length ?? 0;
       return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.test(trimmed);
     };
 
@@ -518,14 +539,17 @@ private async saveDefaultViewToYaml(): Promise<void> {
       ];
     } else {
       const indent = this.detectYamlKeyIndent(content);
+      const pfx = blkPrefix;
       const vLines = [
-        `${indent}view:`,
-        `${indent}  zoom: ${zoom.toFixed(4)}`,
-        `${indent}  centerX: ${cx.toFixed(6)}`,
-        `${indent}  centerY: ${cy.toFixed(6)}`,
+        `${pfx}${indent}view:`,
+        `${pfx}${indent}  zoom: ${zoom.toFixed(4)}`,
+        `${pfx}${indent}  centerX: ${cx.toFixed(6)}`,
+        `${pfx}${indent}  centerY: ${cy.toFixed(6)}`,
       ];
       newContent = [...content, ...vLines];
     }
+
+    if (newContent.join("\n") !== content.join("\n")) didChange = true;
 
     return [
       ...lines.slice(0, blk.start + 1),
@@ -534,7 +558,15 @@ private async saveDefaultViewToYaml(): Promise<void> {
     ].join("\n");
   });
 
-  new Notice("Default view stored in YAML.", 2000);
+    if (!foundBlock) {
+      new Notice("Could not locate zoommap block (embedded/callout?).", 3500);
+      return;
+    }
+    if (!didChange) {
+      new Notice("Default view unchanged (already up to date).", 2000);
+      return;
+    }
+    new Notice("Default view stored in YAML.", 2000);
 }
 
 private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
@@ -554,13 +586,26 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
     return plugin.buildYamlFromViewConfig(pluginCfg);
   };
 
+  let foundBlock = false;
+  let didChange = false;
+
   await this.app.vault.process(af, (text) => {
     const lines = text.split("\n");
     const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
     if (!blk) return text;
+    foundBlock = true;
+
+    const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
 
     const yaml = buildYaml(cfg);
-    const yamlLines = yaml.split("\n");
+    const yamlLinesRaw = yaml.split("\n");
+    const yamlLines = blkPrefix
+      ? yamlLinesRaw.map((ln) => `${blkPrefix}${ln}`)
+      : yamlLinesRaw;
+
+    const before = lines.slice(blk.start + 1, blk.end).join("\n");
+    const after = yamlLines.join("\n");
+    if (before !== after) didChange = true;
 
     return [
       ...lines.slice(0, blk.start + 1),
@@ -569,6 +614,14 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
     ].join("\n");
   });
 
+  if (!foundBlock) {
+    new Notice("Could not locate zoommap block (embedded/callout?).", 3500);
+    return;
+  }
+  if (!didChange) {
+    new Notice("No changes to apply.", 2000);
+    return;
+  }
   new Notice("View updated. Reload the note to see changes.", 2500);
 }
   
@@ -6226,9 +6279,10 @@ if (this.plugin.settings.enableTextLayers && this.data) {
       const lines = text.split("\n");
       const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
       if (!blk) return false;
-      const content = lines.slice(blk.start + 1, blk.end).join("\n");
       const keyLower = key.toLowerCase();
-      return content.split("\n").some((ln) => ln.trimStart().toLowerCase().startsWith(`${keyLower}:`));
+      return lines
+        .slice(blk.start + 1, blk.end)
+        .some((ln) => stripQuotePrefix(ln).trimStart().toLowerCase().startsWith(`${keyLower}:`));
     } catch {
       return false;
     }
@@ -6269,7 +6323,8 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     const keyRe = /^(\s*)image\s*:\s*(.*)$/i;
 
     const out = content.map((ln) => {
-      const m = keyRe.exec(ln);
+      const info = splitQuotePrefix(ln);
+      const m = keyRe.exec(info.rest);
       if (!m) return ln;
 
       const indent = m[1] ?? "";
@@ -6278,7 +6333,7 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
       if (val === oldValue) {
         changed = true;
-        return `${indent}image: ${JSON.stringify(newValue)}`;
+        return `${info.prefix}${indent}image: ${JSON.stringify(newValue)}`;
       }
       return ln;
     });
@@ -6608,22 +6663,26 @@ private patchYamlListRemove(
   const keyRe = new RegExp(`^(\\s*)${key}\\s*:(.*)$`);
   let keyIdx = -1;
   let keyIndent = "";
+  let keyPrefix = "";
 
   for (let i = 0; i < out.length; i++) {
-    const m = keyRe.exec(out[i]);
+    const info = splitQuotePrefix(out[i]);
+    const m = keyRe.exec(info.rest);
     if (m) {
       keyIdx = i;
       keyIndent = m[1] ?? "";
+      keyPrefix = info.prefix;
       break;
     }
   }
   if (keyIdx < 0) return { changed: false, out };
 
   const isNextTopLevelKey = (ln: string) => {
-    const trimmed = ln.trim();
+    const rest = stripQuotePrefix(ln);
+    const trimmed = rest.trim();
     if (!trimmed) return false;
     if (trimmed.startsWith("#")) return false;
-    const spaces = (/^\s*/.exec(ln))?.[0].length ?? 0;
+    const spaces = (/^\s*/.exec(rest))?.[0].length ?? 0;
     return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.exec(trimmed) !== null;
   };
 
@@ -6701,7 +6760,7 @@ private patchYamlListRemove(
   // If empty list, normalize to key: []
   const remainingItems = removed.some((ln) => ln.trimStart().startsWith("-"));
   if (!remainingItems) {
-    nextOut[keyIdx] = `${keyIndent}${key}: []`;
+    nextOut[keyIdx] = `${keyPrefix}${keyIndent}${key}: []`;
     // remove any leftover empty lines directly after key line (optional)
   }
 
@@ -6714,10 +6773,10 @@ private patchYamlListRemove(
   ): { start: number; end: number } | null {
     let result: { start: number; end: number } | null = null;
     for (let i = 0; i < lines.length; i++) {
-      const ln = lines[i].trimStart().toLowerCase();
+      const ln = stripQuotePrefix(lines[i]).trimStart().toLowerCase();
       if (ln.startsWith("```zoommap")) {
         let j = i + 1;
-        while (j < lines.length && !lines[j].trimStart().startsWith("```")) j++;
+        while (j < lines.length && !stripQuotePrefix(lines[j]).trimStart().startsWith("```")) j++;
         if (j >= lines.length) break;
         const block = { start: i, end: j };
         if (typeof approxLine === "number" && i <= approxLine && approxLine <= j) return block;
@@ -6739,13 +6798,16 @@ private patchYamlListRemove(
     let keyIdx = -1;
     let keyIndent = "";
     let after = "";
+    let keyPrefix = "";
 
     for (let i = 0; i < out.length; i++) {
-      const m = keyRe.exec(out[i]);
+      const info = splitQuotePrefix(out[i]);
+      const m = keyRe.exec(info.rest);
       if (m) {
         keyIdx = i;
         keyIndent = m[1] ?? "";
         after = (m[2] ?? "").trim();
+        keyPrefix = info.prefix;
         break;
       }
     }
@@ -6754,20 +6816,21 @@ private patchYamlListRemove(
     const nm = opts?.name ?? "";
     const itemLines: string[] = [];
     const itemIndent = `${keyIndent}  `;
-    itemLines.push(`${itemIndent}- path: ${jsonQuoted}`);
-    itemLines.push(`${itemIndent}  name: ${JSON.stringify(nm)}`);
+    itemLines.push(`${keyPrefix}${itemIndent}- path: ${jsonQuoted}`);
+    itemLines.push(`${keyPrefix}${itemIndent}  name: ${JSON.stringify(nm)}`);
 
     if (keyIdx >= 0) {
-      if (/^\[\s*\]$/.exec(after)) out[keyIdx] = `${keyIndent}${key}:`;
+      if (/^\[\s*\]$/.exec(after)) out[keyIdx] = `${keyPrefix}${keyIndent}${key}:`;
 
       let insertAt = keyIdx + 1;
       let scan = keyIdx + 1;
 
       const isNextTopLevelKey = (ln: string) => {
-        const trimmed = ln.trim();
+        const rest = stripQuotePrefix(ln);
+        const trimmed = rest.trim();
         if (!trimmed) return false;
         if (trimmed.startsWith("#")) return false;
-        const spaces = (/^\s*/.exec(ln))?.[0].length ?? 0;
+        const spaces = (/^\s*/.exec(rest))?.[0].length ?? 0;
         return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.exec(trimmed) !== null;
       };
 
@@ -6786,15 +6849,21 @@ private patchYamlListRemove(
       return { changed: true, out };
     }
 
+    // No key yet: append with the prevailing quote prefix (if any).
+    const blockPrefix =
+      out.map((ln) => splitQuotePrefix(ln).prefix).find((p) => p.length > 0) ?? "";
     const defaultIndent = this.detectYamlKeyIndent(out);
-    out.push(`${defaultIndent}${key}:`);
-    out.push(...itemLines);
+    out.push(`${blockPrefix}${defaultIndent}${key}:`);
+    // rebuild item lines for the new prefix
+    const itemIndent2 = `${defaultIndent}  `;
+    out.push(`${blockPrefix}${itemIndent2}- path: ${jsonQuoted}`);
+    out.push(`${blockPrefix}${itemIndent2}  name: ${JSON.stringify(nm)}`);
     return { changed: true, out };
   }
 
   private detectYamlKeyIndent(lines: string[]): string {
     for (const ln of lines) {
-      const m = /^(\s*)[A-Za-z0-9_-]+\s*:/.exec(ln);
+      const m = /^(\s*)[A-Za-z0-9_-]+\s*:/.exec(stripQuotePrefix(ln));
       if (m) return m[1] ?? "";
     }
     return "";
