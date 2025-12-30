@@ -2656,6 +2656,8 @@ var MapInstance = class extends import_obsidian13.Component {
     super();
     this.zoomHudTimer = null;
     this.initialLayoutDone = false;
+    this.initialViewApplied = false;
+    this.lastGoodView = null;
     this.overlayMap = /* @__PURE__ */ new Map();
     this.baseCanvas = null;
     this.ctx = null;
@@ -2809,6 +2811,9 @@ var MapInstance = class extends import_obsidian13.Component {
     const r = this.viewportEl.getBoundingClientRect();
     this.vw = r.width;
     this.vh = r.height;
+    if (this.vw < 2 || this.vh < 2) {
+      return;
+    }
     if (!this.imgW || !this.imgH || !this.vw || !this.vh) {
       this.fitToView();
       return;
@@ -2818,6 +2823,24 @@ var MapInstance = class extends import_obsidian13.Component {
     const tx = this.vw / 2 - worldX * z;
     const ty = this.vh / 2 - worldY * z;
     this.applyTransform(z, tx, ty);
+    this.initialViewApplied = true;
+    this.captureViewIfVisible();
+  }
+  captureViewIfVisible() {
+    if (!this.imgW || !this.imgH) return;
+    const r = this.viewportEl.getBoundingClientRect();
+    const vw = r.width || 0;
+    const vh = r.height || 0;
+    if (vw < 2 || vh < 2) return;
+    const worldX = (vw / 2 - this.tx) / this.scale;
+    const worldY = (vh / 2 - this.ty) / this.scale;
+    this.lastGoodView = {
+      scale: this.scale,
+      center: {
+        x: clamp(worldX / this.imgW, 0, 1),
+        y: clamp(worldY / this.imgH, 0, 1)
+      }
+    };
   }
   async saveDefaultViewToYaml() {
     if (typeof this.cfg.sectionStart !== "number") {
@@ -4446,14 +4469,20 @@ var MapInstance = class extends import_obsidian13.Component {
   onResize() {
     if (!this.ready || !this.data) return;
     const oldRect = this.viewportEl.getBoundingClientRect();
-    const oldVw = oldRect.width || this.vw || 1;
-    const oldVh = oldRect.height || this.vh || 1;
-    const worldCx = (oldVw / 2 - this.tx) / this.scale;
-    const worldCy = (oldVh / 2 - this.ty) / this.scale;
+    const oldVw = oldRect.width || this.vw || 0;
+    const oldVh = oldRect.height || this.vh || 0;
+    if (oldVw >= 2 && oldVh >= 2) {
+      this.captureViewIfVisible();
+    }
     this.applyViewportInset();
     const r = this.viewportEl.getBoundingClientRect();
-    this.vw = r.width;
-    this.vh = r.height;
+    const newVw = r.width || 0;
+    const newVh = r.height || 0;
+    this.vw = newVw;
+    this.vh = newVh;
+    if (newVw < 2 || newVh < 2) {
+      return;
+    }
     this.updateHudPinsForResize(r);
     if (this.cfg.responsive) {
       this.fitToView();
@@ -4461,6 +4490,25 @@ var MapInstance = class extends import_obsidian13.Component {
       this.renderMarkersOnly();
       return;
     }
+    if (oldVw < 2 || oldVh < 2) {
+      if (!this.initialViewApplied) {
+        if (this.cfg.initialZoom && this.cfg.initialCenter) {
+          this.applyInitialView(this.cfg.initialZoom, this.cfg.initialCenter);
+        } else {
+          this.fitToView();
+        }
+        this.initialViewApplied = true;
+      } else if (this.lastGoodView) {
+        this.applyInitialView(this.lastGoodView.scale, this.lastGoodView.center);
+      } else {
+        this.applyTransform(this.scale, this.tx, this.ty);
+      }
+      if (this.isCanvas()) this.renderCanvas();
+      this.renderMarkersOnly();
+      return;
+    }
+    const worldCx = (oldVw / 2 - this.tx) / this.scale;
+    const worldCy = (oldVh / 2 - this.ty) / this.scale;
     const txNew = this.vw / 2 - worldCx * this.scale;
     const tyNew = this.vh / 2 - worldCy * this.scale;
     this.applyTransform(this.scale, txNew, tyNew, true);
@@ -5953,12 +6001,17 @@ var MapInstance = class extends import_obsidian13.Component {
     const r = this.viewportEl.getBoundingClientRect();
     this.vw = r.width;
     this.vh = r.height;
+    if (this.vw < 2 || this.vh < 2) {
+      return;
+    }
     if (!this.imgW || !this.imgH) return;
     const s = Math.min(this.vw / this.imgW, this.vh / this.imgH);
     const scale = clamp(s, this.cfg.minZoom, this.cfg.maxZoom);
     const tx = (this.vw - this.imgW * scale) / 2;
     const ty = (this.vh - this.imgH * scale) / 2;
     this.applyTransform(scale, tx, ty);
+    this.initialViewApplied = true;
+    this.captureViewIfVisible();
   }
   updateMarkerInvScaleOnly() {
     const invScale = this.cfg.responsive ? 1 : 1 / this.scale;

@@ -266,6 +266,9 @@ export class MapInstance extends Component {
   private zoomHudTimer: number | null = null;
 
   private initialLayoutDone = false;
+  
+  private initialViewApplied = false;
+  private lastGoodView: { scale: number; center: { x: number; y: number } } | null = null;
 
   private overlayMap: Map<string, HTMLImageElement> = new Map<string, HTMLImageElement>();
 
@@ -430,26 +433,50 @@ export class MapInstance extends Component {
   modal.open();
 }
 
-private applyInitialView(zoom: number, center: { x: number; y: number }): void {
-  const z = clamp(zoom, this.cfg.minZoom, this.cfg.maxZoom);
+  private applyInitialView(zoom: number, center: { x: number; y: number }): void {
+    const z = clamp(zoom, this.cfg.minZoom, this.cfg.maxZoom);
 
-  const r = this.viewportEl.getBoundingClientRect();
-  this.vw = r.width;
-  this.vh = r.height;
+    const r = this.viewportEl.getBoundingClientRect();
+    this.vw = r.width;
+    this.vh = r.height;
+  
+    if (this.vw < 2 || this.vh < 2) {
+      return;
+    }
 
-  if (!this.imgW || !this.imgH || !this.vw || !this.vh) {
-    this.fitToView();
-    return;
+    if (!this.imgW || !this.imgH || !this.vw || !this.vh) {
+      this.fitToView();
+      return;
+    }
+
+    const worldX = center.x * this.imgW;
+    const worldY = center.y * this.imgH;
+
+    const tx = this.vw / 2 - worldX * z;
+    const ty = this.vh / 2 - worldY * z;
+
+    this.applyTransform(z, tx, ty);
+    this.initialViewApplied = true;
+    this.captureViewIfVisible();  
   }
 
-  const worldX = center.x * this.imgW;
-  const worldY = center.y * this.imgH;
+  private captureViewIfVisible(): void {
+    if (!this.imgW || !this.imgH) return;
+    const r = this.viewportEl.getBoundingClientRect();
+    const vw = r.width || 0;
+    const vh = r.height || 0;
+    if (vw < 2 || vh < 2) return;
+    const worldX = (vw / 2 - this.tx) / this.scale;
+    const worldY = (vh / 2 - this.ty) / this.scale;
 
-  const tx = this.vw / 2 - worldX * z;
-  const ty = this.vh / 2 - worldY * z;
-
-  this.applyTransform(z, tx, ty);
-}
+    this.lastGoodView = {
+      scale: this.scale,
+      center: {
+        x: clamp(worldX / this.imgW, 0, 1),
+        y: clamp(worldY / this.imgH, 0, 1),
+      },
+    };
+  }
 
 private async saveDefaultViewToYaml(): Promise<void> {
   if (typeof this.cfg.sectionStart !== "number") {
@@ -2481,18 +2508,25 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
     if (!this.ready || !this.data) return;
 
     const oldRect = this.viewportEl.getBoundingClientRect();
-    const oldVw = oldRect.width || this.vw || 1;
-    const oldVh = oldRect.height || this.vh || 1;
+    const oldVw = oldRect.width || this.vw || 0;
+    const oldVh = oldRect.height || this.vh || 0;
 
-    // Preserve the world position at the center while the viewport size changes.
-    const worldCx = (oldVw / 2 - this.tx) / this.scale;
-    const worldCy = (oldVh / 2 - this.ty) / this.scale;
+    if (oldVw >= 2 && oldVh >= 2) {
+      this.captureViewIfVisible();
+    }
 
     this.applyViewportInset();
 
     const r = this.viewportEl.getBoundingClientRect();
-    this.vw = r.width;
-    this.vh = r.height;
+    const newVw = r.width || 0;
+    const newVh = r.height || 0;
+    this.vw = newVw;
+    this.vh = newVh;
+
+    // If hidden/collapsed, do not apply any "preserve center" math.
+    if (newVw < 2 || newVh < 2) {
+      return;
+    }
 
     this.updateHudPinsForResize(r);
 
@@ -2502,6 +2536,32 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
       this.renderMarkersOnly();
       return;
     }
+	
+    // Apply initial view once, otherwise restore last known view.
+    if (oldVw < 2 || oldVh < 2) {
+      if (!this.initialViewApplied) {
+        if (this.cfg.initialZoom && this.cfg.initialCenter) {
+          this.applyInitialView(this.cfg.initialZoom, this.cfg.initialCenter);
+        } else {
+          this.fitToView();
+        }
+        this.initialViewApplied = true;
+      } else if (this.lastGoodView) {
+        this.applyInitialView(this.lastGoodView.scale, this.lastGoodView.center);
+      } else {
+        // Fallback: keep current transform
+        this.applyTransform(this.scale, this.tx, this.ty);
+      }
+
+      if (this.isCanvas()) this.renderCanvas();
+      this.renderMarkersOnly();
+      return;
+    }
+
+    // Preserve the world position at the center while the viewport size changes.
+    const worldCx = (oldVw / 2 - this.tx) / this.scale;
+    const worldCy = (oldVh / 2 - this.ty) / this.scale;
+
 
     const txNew = this.vw / 2 - worldCx * this.scale;
     const tyNew = this.vh / 2 - worldCy * this.scale;
@@ -4173,12 +4233,18 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     const r = this.viewportEl.getBoundingClientRect();
     this.vw = r.width;
     this.vh = r.height;
+    if (this.vw < 2 || this.vh < 2) {
+      return;
+    }
+
     if (!this.imgW || !this.imgH) return;
     const s = Math.min(this.vw / this.imgW, this.vh / this.imgH);
     const scale = clamp(s, this.cfg.minZoom, this.cfg.maxZoom);
     const tx = (this.vw - this.imgW * scale) / 2;
     const ty = (this.vh - this.imgH * scale) / 2;
     this.applyTransform(scale, tx, ty);
+    this.initialViewApplied = true;
+    this.captureViewIfVisible();
   }
 
   private updateMarkerInvScaleOnly(): void {
