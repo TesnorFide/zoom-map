@@ -1,4 +1,4 @@
-import { Component, Modal, Notice, TFile } from "obsidian";
+import { Component, Modal, Notice, TFile, parseYaml, stringifyYaml, normalizePath } from "obsidian";
 import type { App } from "obsidian";
 import { generateId, MarkerStore } from "./markerStore";
 import type {
@@ -171,6 +171,12 @@ export interface ZoomMapSettings {
   preferActiveLayerInEditor?: boolean;
   enableTextLayers?: boolean;
   travelTimePresets?: TravelTimePreset[];
+  
+  // Session image cache
+  enableSessionImageCache?: boolean;
+  sessionImageCacheMb?: number;
+  keepOverlaysLoaded?: boolean;
+  preferCanvasImagesWhenCaching?: boolean;
 }
 
 interface Point { x: number; y: number; }
@@ -201,10 +207,30 @@ function isSvgDataUrl(src: string): boolean {
 
 // --- Blockquote / callout helpers (for embedded zoommap blocks) ---
 function splitQuotePrefix(line: string): { prefix: string; rest: string } {
-  // Matches any number of blockquote markers: "> " or "> > " etc.
-  const m = /^(\s*(?:>\s*)+)(.*)$/.exec(line);
-  if (m) return { prefix: m[1] ?? "", rest: m[2] ?? "" };
-  return { prefix: "", rest: line };
+  const len = line.length;
+  let i = 0;
+
+  while (i < len && (line[i] === " " || line[i] === "\t")) i++;
+
+  if (i >= len || line[i] !== ">") return { prefix: "", rest: line };
+
+  while (i < len && line[i] === ">") {
+    i++;
+
+    if (i < len && (line[i] === " " || line[i] === "\t")) i++;
+
+    let j = i;
+    while (j < len && (line[j] === " " || line[j] === "\t")) j++;
+
+    if (j < len && line[j] === ">") {
+      i = j;
+      continue;
+    }
+
+    break;
+  }
+
+  return { prefix: line.slice(0, i), rest: line.slice(i) };
 }
 
 function stripQuotePrefix(line: string): string {
@@ -274,10 +300,13 @@ export class MapInstance extends Component {
 
   private baseCanvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
-  private baseBitmap: ImageBitmap | null = null;
+  private baseSource: CanvasImageSource | null = null;
 
   private overlaySources: Map<string, CanvasImageSource> = new Map<string, CanvasImageSource>();
   private overlayLoading: Map<string, Promise<CanvasImageSource | null>> = new Map<string, Promise<CanvasImageSource | null>>();
+
+  // Session-cache tracking (per map instance)
+  private acquiredSessionPaths: Set<string> = new Set<string>();
 
   // Text layers (character sheets)
   private textSvgWrap!: HTMLDivElement;
@@ -338,6 +367,7 @@ export class MapInstance extends Component {
   private ignoreNextModify = false;
 
   private ro: ResizeObserver | null = null;
+  private calloutMo: MutationObserver | null = null;
   private ready = false;
 
   private openMenu: ZMMenu | null = null;
@@ -378,6 +408,144 @@ export class MapInstance extends Component {
   private userResizing = false;
 
   private yamlAppliedOnce = false;
+  
+  private stripYamlScalar(s: string): string {
+    const t = s.trim();
+    if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+      return t.slice(1, -1);
+    }
+    return t;
+  }
+  
+  private isPlainObject(val: unknown): val is Record<string, unknown> {
+    return typeof val === "object" && val !== null && !Array.isArray(val);
+  }
+
+  private parseZoommapYamlFromBlock(lines: string[], blk: { start: number; end: number }): Record<string, unknown> | null {
+    const raw = lines
+      .slice(blk.start + 1, blk.end)
+      .map((ln) => stripQuotePrefix(ln))
+      .join("\n");
+    try {
+      const parsed: unknown = parseYaml(raw);
+      return this.isPlainObject(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private firstBasePathFromYaml(obj: Record<string, unknown>): string {
+    const bases = obj["imageBases"];
+    if (!Array.isArray(bases) || bases.length === 0) return "";
+    const first = bases[0] as unknown;
+    if (typeof first === "string") return first.trim();
+    if (this.isPlainObject(first) && typeof first["path"] === "string") return String(first["path"]).trim();
+    return "";
+  }
+
+  private scalarString(obj: Record<string, unknown>, key: string): string {
+    const v = obj[key];
+    return typeof v === "string" ? v.trim() : "";
+  }
+
+  private computeEffectiveImageFromYaml(obj: Record<string, unknown>): string {
+    return this.scalarString(obj, "image") || this.firstBasePathFromYaml(obj);
+  }
+
+  private computeEffectiveMarkersFromYaml(obj: Record<string, unknown>): string {
+    const m = this.scalarString(obj, "markers");
+    if (m) return m;
+    const img = this.computeEffectiveImageFromYaml(obj);
+    return img ? `${img}.markers.json` : "";
+  }
+
+  private findAllZoommapBlocks(lines: string[]): { start: number; end: number }[] {
+    const blocks: { start: number; end: number }[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const ln = stripQuotePrefix(lines[i]).trimStart().toLowerCase();
+      if (!ln.startsWith("```zoommap")) continue;
+      let j = i + 1;
+      while (j < lines.length && !stripQuotePrefix(lines[j]).trimStart().startsWith("```")) j++;
+      if (j >= lines.length) break;
+      blocks.push({ start: i, end: j });
+      i = j;
+    }
+    return blocks;
+  }
+
+  private readYamlScalarFromBlock(blockLines: string[], key: string): string | null {
+    const re = new RegExp(`^\\s*${key}\\s*:\\s*(.+)\\s*$`, "i");
+    for (const ln of blockLines) {
+      const rest = stripQuotePrefix(ln);
+      const m = re.exec(rest);
+      if (m) return this.stripYamlScalar(m[1] ?? "");
+    }
+    return null;
+  }
+
+  private findZoommapBlockForThisMap(lines: string[]): { start: number; end: number } | null {
+    const wantId = (this.cfg.mapId ?? "").trim();
+    const wantMarkers =
+      this.cfg.storageMode === "json" ? normalizePath(this.cfg.markersPath ?? "") : "";
+    const wantImage = normalizePath(this.cfg.imagePath ?? "");
+
+    const all = this.findAllZoommapBlocks(lines);
+
+    // 1) Best match: id (most reliable, esp. with nested callouts + multiple maps)
+    if (wantId) {
+      let found: { start: number; end: number } | null = null;
+      let dupCount = 0;
+
+      for (const blk of all) {
+        const y = this.parseZoommapYamlFromBlock(lines, blk);
+        if (!y) continue;
+
+        const id = this.scalarString(y, "id");
+        if (id !== wantId) continue;
+
+        if (!found) found = blk;
+        else dupCount++;
+      }
+
+      if (found) {
+        if (dupCount > 0) {
+          console.warn(
+            "Zoom Map: duplicate zoommap id detected in note.",
+            { id: wantId, duplicates: dupCount + 1, sourcePath: this.cfg.sourcePath },
+          );
+        }
+        return found;
+      }
+    }
+
+    // 2) Fallback: sectionStart based lookup (can be unreliable in nested callouts)
+    if (typeof this.cfg.sectionStart === "number") {
+      const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
+      if (blk) return blk;
+    }
+
+    // 3) Fallback: markersPath / image match
+    let best: { start: number; end: number } | null = null;
+
+    for (const blk of all) {
+      const y = this.parseZoommapYamlFromBlock(lines, blk);
+      if (!y) continue;
+
+      const image = this.computeEffectiveImageFromYaml(y);
+      const markers = this.computeEffectiveMarkersFromYaml(y);
+
+      if (!best && wantMarkers && markers && normalizePath(markers) === wantMarkers) {
+        best = blk;
+        continue;
+      }
+
+      if (!best && wantImage && image && normalizePath(image) === wantImage) {
+        best = blk;
+      }
+    }
+
+    return best;
+  }
   
   private openViewEditorFromMap(): void {
   if (!this.data) return;
@@ -479,11 +647,6 @@ export class MapInstance extends Component {
   }
 
 private async saveDefaultViewToYaml(): Promise<void> {
-  if (typeof this.cfg.sectionStart !== "number") {
-    new Notice("Cannot store default view (no YAML section info).", 2500);
-    return;
-  }
-
   const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
   if (!(af instanceof TFile)) {
     new Notice("Source note not found.", 2500);
@@ -514,10 +677,10 @@ private async saveDefaultViewToYaml(): Promise<void> {
 
     await this.app.vault.process(af, (text) => {
     const lines = text.split("\n");
-    const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
+    const blk = this.findZoommapBlockForThisMap(lines);
     if (!blk) return text;
     foundBlock = true;
-
+	
     const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
 
     const content = lines.slice(blk.start + 1, blk.end);
@@ -597,10 +760,6 @@ private async saveDefaultViewToYaml(): Promise<void> {
 }
 
 private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
-  if (typeof this.cfg.sectionStart !== "number") {
-    new Notice("Cannot update YAML for this map (no section info).", 3000);
-    return;
-  }
 
   const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
   if (!(af instanceof TFile)) {
@@ -608,27 +767,68 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
     return;
   }
 
-  const buildYaml = (pluginCfg: ViewEditorConfig): string => {
-    const plugin = this.plugin;
-    return plugin.buildYamlFromViewConfig(pluginCfg);
-  };
+  const buildYaml = (pluginCfg: ViewEditorConfig): string => this.plugin.buildYamlFromViewConfig(pluginCfg);
 
   let foundBlock = false;
   let didChange = false;
 
   await this.app.vault.process(af, (text) => {
     const lines = text.split("\n");
-    const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
+    const blk = this.findZoommapBlockForThisMap(lines);
     if (!blk) return text;
     foundBlock = true;
 
     const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
 
-    const yaml = buildYaml(cfg);
-    const yamlLinesRaw = yaml.split("\n");
-    const yamlLines = blkPrefix
-      ? yamlLinesRaw.map((ln) => `${blkPrefix}${ln}`)
-      : yamlLinesRaw;
+    // Parse existing YAML (so we can preserve keys that are NOT managed by the view editor, e.g. `view:`)
+    const existingObj = this.parseZoommapYamlFromBlock(lines, blk) ?? {};
+
+    // Parse new YAML (generated from the view editor modal)
+    const nextYamlStr = buildYaml(cfg);
+    let nextObj: Record<string, unknown> = {};
+    try {
+	  const parsed: unknown = parseYaml(nextYamlStr);
+      if (this.isPlainObject(parsed)) nextObj = parsed;
+    } catch {
+      // If parsing fails, fall back to full replace (old behavior)
+      nextObj = {};
+    }
+
+    // Merge: keep unknown keys from existing, overwrite managed keys from next
+    const merged: Record<string, unknown> = { ...existingObj, ...nextObj };
+
+    // If a key is "managed" by the view editor and missing in nextObj, remove it from merged
+    // (e.g. user unticks "useWidth"/"useHeight" => width/height should be removed)
+    const managedKeys = [
+      "image",
+      "imageBases",
+      "imageOverlays",
+      "markers",
+      "markerLayers",
+      "minZoom",
+      "maxZoom",
+      "wrap",
+      "responsive",
+      "width",
+      "height",
+      "resizable",
+      "resizeHandle",
+      "render",
+      "align",
+      "id",
+      "viewportFrame",
+      "viewportFrameInsets",
+    ] as const;
+
+    for (const k of managedKeys) {
+      if (!(k in nextObj) && k in merged) {
+        delete merged[k];
+      }
+    }
+
+    const mergedYamlStr = stringifyYaml(merged).trimEnd();
+    const yamlLinesRaw = mergedYamlStr.split("\n");
+    const yamlLines = blkPrefix ? yamlLinesRaw.map((ln) => `${blkPrefix}${ln}`) : yamlLinesRaw;
 
     const before = lines.slice(blk.start + 1, blk.end).join("\n");
     const after = yamlLines.join("\n");
@@ -835,8 +1035,58 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
     this.tintedSvgCache.clear();
     this.tooltipEl?.remove();
     this.ro?.disconnect();
+    this.calloutMo?.disconnect();
     this.closeMenu();
     this.disposeBitmaps();
+  }
+  
+  private collectAncestorCallouts(): HTMLElement[] {
+    const out: HTMLElement[] = [];
+    let cur: HTMLElement | null = this.el;
+    while (cur) {
+      const callout = cur.closest?.(".callout");
+      if (callout && callout instanceof HTMLElement) {
+        if (!out.includes(callout)) out.push(callout);
+        cur = callout.parentElement;
+      } else {
+        break;
+      }
+    }
+    return out;
+  }
+
+  private scheduleTryApplyInitialViewFromCallout(): void {
+    if (this.cfg.responsive) return;
+    if (!this.cfg.initialZoom || !this.cfg.initialCenter) return;
+    if (this.initialViewApplied) return;
+
+    const callouts = this.collectAncestorCallouts();
+    if (callouts.length === 0) return;
+
+    const tryApply = () => {
+      if (this.initialViewApplied) return;
+      if (callouts.some((c) => c.classList.contains("is-collapsed"))) return;
+
+      const r = this.viewportEl.getBoundingClientRect();
+      if ((r.width || 0) < 2 || (r.height || 0) < 2) return;
+
+      this.applyInitialView(this.cfg.initialZoom!, this.cfg.initialCenter!);
+      if (this.isCanvas()) this.renderCanvas();
+      this.renderMarkersOnly();
+    };
+
+    this.calloutMo?.disconnect();
+    this.calloutMo = new MutationObserver(() => {
+      // Wait one frame for layout to settle after expanding the callout.
+      window.requestAnimationFrame(() => tryApply());
+    });
+
+    for (const c of callouts) {
+      this.calloutMo.observe(c, { attributes: true, attributeFilter: ["class"] });
+    }
+
+    // Try once immediately in case the callout is already open but layout was 0 during bootstrap.
+    window.requestAnimationFrame(() => tryApply());
   }
 
   private async bootstrap(): Promise<void> {
@@ -903,6 +1153,18 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
       img.draggable = false;
       img.src = this.resolveResourceUrl(this.cfg.viewportFrame!.trim());
       this.viewportFrameEl = img;
+	  
+      // Keep frame image in the session cache (if enabled) for fast note switching.
+      if (this.plugin.imageCache) {
+        const f = this.resolveTFile(this.cfg.viewportFrame!.trim(), this.cfg.sourcePath);
+        if (f && !this.acquiredSessionPaths.has(f.path)) {
+          void this.plugin.imageCache.acquire(f).then(() => {
+            this.acquiredSessionPaths.add(f.path);
+          }).catch(() => {
+            // ignore
+          });
+        }
+      }
     }
 
     // HUD clip must be above the frame.
@@ -1076,6 +1338,9 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
 	} else {
 	  this.fitToView();
 	}
+	
+    // If the map is inside a collapsed callout on note load, apply the initial view when it is first opened.
+    this.scheduleTryApplyInitialViewFromCallout();
 
     await this.applyActiveBaseAndOverlays();
     this.setupMeasureOverlay();
@@ -1094,12 +1359,25 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
   }
 
   private disposeBitmaps(): void {
+    const cache = this.plugin.imageCache;
+    if (cache) {
+      for (const p of this.acquiredSessionPaths) {
+        cache.release(p);
+      }
+      this.acquiredSessionPaths.clear();
+      this.baseSource = null;
+      this.overlaySources.clear();
+      this.overlayLoading.clear();
+      return;
+    }
+
+    // Fallback: old behavior without session cache
     try {
-      if (this.baseBitmap && isImageBitmapLike(this.baseBitmap)) this.baseBitmap.close();
+      if (this.baseSource && isImageBitmapLike(this.baseSource)) this.baseSource.close();
     } catch (error) {
       console.error("Zoom Map: failed to dispose base bitmap", error);
     }
-    this.baseBitmap = null;
+    this.baseSource = null;
 
     for (const src of this.overlaySources.values()) {
       try { if (isImageBitmapLike(src)) src.close(); }
@@ -1130,15 +1408,40 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
 	}
   }
 
-  private async loadBaseBitmapByPath(path: string): Promise<void> {
+  private async loadBaseSourceByPath(path: string): Promise<void> {
+    const cache = this.plugin.imageCache;
+    if (cache) {
+      const f = this.resolveTFile(path, this.cfg.sourcePath);
+      if (!f) throw new Error(`Image not found: ${path}`);
+
+      if (!this.acquiredSessionPaths.has(f.path)) {
+        await cache.acquire(f);
+        this.acquiredSessionPaths.add(f.path);
+      }
+
+      // We still need a CanvasImageSource reference to draw; acquire() returns the cached source
+      const src = await cache.acquire(f);
+      // Balance the extra acquire() above:
+      cache.release(f.path);
+
+      this.baseSource = src as CanvasImageSource;
+      // Determine size
+      if (isImageBitmapLike(src)) {
+        this.imgW = src.width;
+        this.imgH = src.height;
+      } else if (src instanceof HTMLImageElement) {
+        this.imgW = src.naturalWidth;
+        this.imgH = src.naturalHeight;
+      }
+
+      this.currentBasePath = path;
+      return;
+    }
+
+    // No session cache: use old load behavior
     const bmp = await this.loadBitmapFromPath(path);
     if (!bmp) throw new Error(`Failed to load image: ${path}`);
-    try {
-      if (this.baseBitmap && isImageBitmapLike(this.baseBitmap)) this.baseBitmap.close();
-    } catch (error) {
-      console.error("Zoom Map: failed to dispose previous base bitmap", error);
-    }
-    this.baseBitmap = bmp;
+    this.baseSource = bmp;
     this.imgW = bmp.width;
     this.imgH = bmp.height;
     this.currentBasePath = path;
@@ -1157,7 +1460,7 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
   }
 
   private async loadInitialBase(path: string): Promise<void> {
-    if (this.isCanvas()) await this.loadBaseBitmapByPath(path);
+    if (this.isCanvas()) await this.loadBaseSourceByPath(path);
     else await this.loadBaseImageByPath(path);
   }
 
@@ -1188,6 +1491,26 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
   }
 
   private async ensureOverlayLoaded(path: string): Promise<CanvasImageSource | null> {
+    const cache = this.plugin.imageCache;
+    if (cache) {
+      if (this.overlaySources.has(path)) return this.overlaySources.get(path) ?? null;
+
+      const f = this.resolveTFile(path, this.cfg.sourcePath);
+      if (!f) return null;
+
+      if (!this.acquiredSessionPaths.has(f.path)) {
+        await cache.acquire(f);
+        this.acquiredSessionPaths.add(f.path);
+      }
+
+      // Get the actual cached source reference to draw
+      const src = await cache.acquire(f);
+      cache.release(f.path);
+
+      this.overlaySources.set(path, src as CanvasImageSource);
+      return src as CanvasImageSource;
+    }
+
     if (this.overlaySources.has(path)) return this.overlaySources.get(path) ?? null;
     if (this.overlayLoading.has(path)) return this.overlayLoading.get(path) ?? null;
 
@@ -1209,7 +1532,12 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
 
   private async ensureVisibleOverlaysLoaded(): Promise<void> {
     if (!this.data) return;
-    const wantVisible = new Set<string>((this.data.overlays ?? []).filter((o) => o.visible).map((o) => o.path));
+    const keepAll = !!this.plugin.settings.enableSessionImageCache && !!this.plugin.settings.keepOverlaysLoaded;
+    const wantVisible = new Set<string>(
+      (this.data.overlays ?? [])
+        .filter((o) => keepAll || o.visible)
+        .map((o) => o.path),
+    );
 
     for (const [path, src] of this.overlaySources) {
       if (!wantVisible.has(path)) {
@@ -1225,7 +1553,7 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
 
   private renderCanvas(): void {
     if (!this.isCanvas()) return;
-    if (!this.baseCanvas || !this.ctx || !this.baseBitmap) return;
+    if (!this.baseCanvas || !this.ctx || !this.baseSource) return;
 
     const r = this.viewportEl.getBoundingClientRect();
     this.vw = r.width;
@@ -1251,7 +1579,7 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = this.scale < 0.18 ? "low" : "medium";
 
-    ctx.drawImage(this.baseBitmap, 0, 0);
+    ctx.drawImage(this.baseSource, 0, 0);
 
     if (this.data?.overlays?.length) {
       for (const o of this.data.overlays) {
@@ -6078,7 +6406,7 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     this.data.image = path;
 
     if (this.isCanvas()) {
-      await this.loadBaseBitmapByPath(path);
+      await this.loadBaseSourceByPath(path);
     } else {
       const file = this.resolveTFile(path, this.cfg.sourcePath);
       if (!file) { new Notice(`Base image not found: ${path}`); return; }
@@ -6118,33 +6446,24 @@ if (this.plugin.settings.enableTextLayers && this.data) {
   }
 
   private buildOverlayElements(): void {
-    if (this.isCanvas()) return;
-    this.overlayMap.clear();
-    this.overlaysEl.empty();
-    if (!this.data) return;
+     if (this.isCanvas()) return;
+     this.overlayMap.clear();
+     this.overlaysEl.empty();
+     if (!this.data) return;
 
-    const mkImgEl = (url: string) => {
+	for (const o of this.data.overlays ?? []) {
+       const f = this.resolveTFile(o.path, this.cfg.sourcePath);
+       if (!f) continue;
+       const url = this.app.vault.getResourcePath(f);
+	   
       const el = this.overlaysEl.createEl("img", { cls: "zm-overlay-image" });
       el.decoding = "async";
       el.loading = "eager";
+      el.draggable = false;
       el.src = url;
-      return el;
-    };
 
-    for (const o of this.data.overlays ?? []) {
-      const f = this.resolveTFile(o.path, this.cfg.sourcePath);
-      if (!f) continue;
-      const url = this.app.vault.getResourcePath(f);
-
-      const pre = new Image();
-      pre.decoding = "async";
-      pre.src = url;
-      void pre.decode().catch((error) => { console.error("Zoom Map: overlay decode error", error); })
-        .finally(() => {
-          const el = mkImgEl(url);
-          if (!o.visible) el.classList.add("zm-overlay-hidden");
-          this.overlayMap.set(o.path, el);
-        });
+      if (!o.visible) el.classList.add("zm-overlay-hidden");
+      this.overlayMap.set(o.path, el);	   
     }
   }
 
@@ -6349,12 +6668,11 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
   private async isYamlKeyPresent(key: string): Promise<boolean> {
     try {
-      if (typeof this.cfg.sectionStart !== "number" || typeof this.cfg.sectionEnd !== "number") return false;
       const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
       if (!(af instanceof TFile)) return false;
       const text = await this.app.vault.read(af);
       const lines = text.split("\n");
-      const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
+      const blk = this.findZoommapBlockForThisMap(lines);
       if (!blk) return false;
       const keyLower = key.toLowerCase();
       return lines
@@ -6370,10 +6688,6 @@ if (this.plugin.settings.enableTextLayers && this.data) {
   oldValue: string,
   newValue: string,
 ): Promise<boolean> {
-  if (typeof this.cfg.sectionStart !== "number" || typeof this.cfg.sectionEnd !== "number") {
-    return false;
-  }
-
   const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
   if (!(af instanceof TFile)) return false;
 
@@ -6389,7 +6703,7 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
   await this.app.vault.process(af, (text) => {
     const lines = text.split("\n");
-    const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
+    const blk = this.findZoommapBlockForThisMap(lines);
     if (!blk) return text;
 
     foundBlock = true;
@@ -6659,7 +6973,6 @@ private async deleteOverlayByPath(path: string): Promise<void> {
   newPath: string,
   opts?: { name?: string },
 ): Promise<boolean> {
-    if (typeof this.cfg.sectionStart !== "number" || typeof this.cfg.sectionEnd !== "number") return false;
     const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
     if (!(af instanceof TFile)) return false;
 
@@ -6667,7 +6980,7 @@ private async deleteOverlayByPath(path: string): Promise<void> {
 
     await this.app.vault.process(af, (text) => {
     const lines = text.split("\n");
-    const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
+    const blk = this.findZoommapBlockForThisMap(lines);
     if (!blk) return text;
 
     foundBlock = true;
@@ -6697,10 +7010,6 @@ private async deleteOverlayByPath(path: string): Promise<void> {
   key: "imageBases" | "imageOverlays",
   removePath: string,
 ): Promise<boolean> {
-  if (typeof this.cfg.sectionStart !== "number" || typeof this.cfg.sectionEnd !== "number") {
-    return false;
-  }
-
   const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
   if (!(af instanceof TFile)) return false;
 
@@ -6708,7 +7017,7 @@ private async deleteOverlayByPath(path: string): Promise<void> {
 
   await this.app.vault.process(af, (text) => {
     const lines = text.split("\n");
-    const blk = this.findZoommapBlock(lines, this.cfg.sectionStart);
+    const blk = this.findZoommapBlockForThisMap(lines);
     if (!blk) return text;
 
     foundBlock = true;

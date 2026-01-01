@@ -29,6 +29,7 @@ import { JsonFileSuggestModal } from "./jsonFileSuggest";
 import { FaIconPickerModal } from "./faIconPickerModal";
 import { PreferencesModal } from "./preferencesModal";
 import { IconOutlineModal } from "./iconOutlineModal";
+import { ImageCache } from "./imageCache";
 
 /* ---------------- Utils ---------------- */
 
@@ -126,6 +127,10 @@ const DEFAULT_SETTINGS: ZoomMapSettingsExtended = {
   enableDrawing: false,
   preferActiveLayerInEditor: false,
   enableTextLayers: false,
+  enableSessionImageCache: false,
+  sessionImageCacheMb: 512,
+  keepOverlaysLoaded: false,
+  preferCanvasImagesWhenCaching: false,  
 };
 
 /* ---------------- YAML parsing helpers ---------------- */
@@ -359,6 +364,7 @@ async function readSavedFrame(
 
 export default class ZoomMapPlugin extends Plugin {
   settings: ZoomMapSettings = DEFAULT_SETTINGS;
+  imageCache: ImageCache | null = null;
 
   activeMap: MapInstance | null = null;
 
@@ -368,6 +374,7 @@ export default class ZoomMapPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    this.applyImageCacheSettings();
 	
 	this.addCommand({
     id: "insert-new-map",
@@ -489,8 +496,12 @@ export default class ZoomMapPlugin extends Plugin {
 		  }
 		}
 
+        const preferCanvas =
+          !!this.settings.enableSessionImageCache &&
+          !!this.settings.preferCanvasImagesWhenCaching;
+
         const renderMode: "dom" | "canvas" =
-          opts.render === "canvas" ? "canvas" : "dom";
+          preferCanvas ? "canvas" : (opts.render === "canvas" ? "canvas" : "dom");
 
         let image = typeof opts.image === "string" ? opts.image.trim() : "";
         if (!image && yamlBases.length > 0) image = yamlBases[0].path;
@@ -623,6 +634,11 @@ export default class ZoomMapPlugin extends Plugin {
 
     this.addSettingTab(new ZoomMapSettingTab(this.app, this));
   }
+  
+  onunload(): void {
+    this.imageCache?.clear();
+    this.imageCache = null;
+  }
 
   builtinIcon(): IconProfile {
     return (
@@ -653,11 +669,36 @@ export default class ZoomMapPlugin extends Plugin {
     this.settings.customUnits ??= [];
 	this.settings.travelTimePresets ??= [];
 	this.settings.enableTextLayers ??= false;
+	
+    this.settings.enableSessionImageCache ??= false;
+    this.settings.sessionImageCacheMb ??= 512;
+    this.settings.keepOverlaysLoaded ??= false;
+    this.settings.preferCanvasImagesWhenCaching ??= false;	
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+    this.applyImageCacheSettings();
   }
+  
+  private applyImageCacheSettings(): void {
+    const enabled = !!this.settings.enableSessionImageCache;
+    if (!enabled) {
+      this.imageCache?.clear();
+      this.imageCache = null;
+      return;
+    }
+
+    const mbRaw = this.settings.sessionImageCacheMb ?? 512;
+    const mb = Number.isFinite(mbRaw) && mbRaw > 0 ? mbRaw : 512;
+    const bytes = Math.round(mb * 1024 * 1024);
+
+    if (!this.imageCache) {
+      this.imageCache = new ImageCache(this.app, bytes);
+    } else {
+      this.imageCache.setMaxBytes(bytes);
+    }
+  } 
 
   /* -------- Library file (icons + collections) -------- */
 

@@ -14,6 +14,68 @@ export class PreferencesModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "Preferences" });
+	
+    // Session image cache
+    contentEl.createEl("h3", { text: "Session image cache" });
+
+    let mbInput: HTMLInputElement | null = null;
+    let keepOverlayToggle: HTMLInputElement | null = null;
+    let hybridToggle: HTMLInputElement | null = null;
+
+    const applyEnabledState = () => {
+      const on = !!this.plugin.settings.enableSessionImageCache;
+      if (mbInput) mbInput.disabled = !on;
+      if (keepOverlayToggle) keepOverlayToggle.disabled = !on;
+      if (hybridToggle) hybridToggle.disabled = !on;
+    };
+
+    new Setting(contentEl)
+      .setName("Enable session image cache")
+      .setDesc("Caches decoded images across the entire Obsidian session (ref-counted, evicts only when near limit).")
+      .addToggle((toggle) => {
+        toggle.setValue(!!this.plugin.settings.enableSessionImageCache).onChange(async (value) => {
+          this.plugin.settings.enableSessionImageCache = value;
+          await this.plugin.saveSettings();
+          applyEnabledState();
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("Cache size in megabyte")
+      .setDesc("Maximum memory used for cached decoded images. Default: 512 megabyte.")
+      .addText((t) => {
+        t.inputEl.type = "number";
+        t.setValue(String(this.plugin.settings.sessionImageCacheMb ?? 512));
+        mbInput = t.inputEl;
+        t.onChange(async (v) => {
+          const n = Number(String(v).replace(",", "."));
+          if (!Number.isFinite(n) || n <= 0) return;
+          this.plugin.settings.sessionImageCacheMb = Math.round(n);
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("Keep overlays loaded")
+      .setDesc("When enabled, all overlays of an open map are kept in the session cache (even if hidden).")
+      .addToggle((toggle) => {
+        toggle.setValue(!!this.plugin.settings.keepOverlaysLoaded).onChange(async (value) => {
+          this.plugin.settings.keepOverlaysLoaded = value;
+          await this.plugin.saveSettings();
+        });
+        keepOverlayToggle = toggle.toggleEl;
+      });
+
+    new Setting(contentEl)
+      .setName("Hybrid render: canvas images + DOM markers")
+      .setDesc("When enabled (and cache is enabled), maps will use canvas rendering for base/overlay images while markers stay DOM. Useful for fast image redraw on weaker devices.")
+      .addToggle((toggle) => {
+        toggle.setValue(!!this.plugin.settings.preferCanvasImagesWhenCaching).onChange(async (value) => {
+          this.plugin.settings.preferCanvasImagesWhenCaching = value;
+          await this.plugin.saveSettings();
+        });
+        hybridToggle = toggle.toggleEl;
+      });	
 
     new Setting(contentEl)
       .setName("Enable text layers")
@@ -58,6 +120,8 @@ export class PreferencesModal extends Modal {
     const footer = contentEl.createDiv({ cls: "zoommap-modal-footer" });
     const closeBtn = footer.createEl("button", { text: "Close" });
     closeBtn.onclick = () => this.close();
+	
+    applyEnabledState();	
   }
 
   onClose(): void {
