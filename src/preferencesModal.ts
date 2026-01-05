@@ -75,7 +75,25 @@ export class PreferencesModal extends Modal {
           await this.plugin.saveSettings();
         });
         hybridToggle = toggle.toggleEl;
-      });	
+      });
+	  
+    // SVG raster quality (canvas)
+    contentEl.createEl("h3", { text: "Other preferences" });
+    new Setting(contentEl)
+      .setName("Max SVG raster scale")
+      .setDesc("Controls the maximum raster lod for SVG base images. Higher = sharper at high zoom, but more RAM and slower upgrades.")
+      .addDropdown((d) => {
+        d.addOption("2", "2× (low-end)");
+        d.addOption("4", "4× (balanced)");
+        d.addOption("8", "8× (high quality)");
+        const cur = String(this.plugin.settings.svgRasterMaxScale ?? 8);
+        d.setValue(cur);
+        d.onChange(async (v) => {
+          const n = (Number(v) as 2 | 4 | 8);
+          this.plugin.settings.svgRasterMaxScale = (n === 2 || n === 4 || n === 8) ? n : 8;
+          await this.plugin.saveSettings();
+        });
+      });
 
     new Setting(contentEl)
       .setName("Enable text layers")

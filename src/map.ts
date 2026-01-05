@@ -27,6 +27,7 @@ import { PinSizeEditorModal, type PinSizeEditorRow } from "./pinSizeEditorModal"
 import { ViewEditorModal, type ViewEditorConfig } from "./viewEditorModal";
 import { SwapFramesEditorModal } from "./collectionsModals";
 import { TextLayerStyleModal } from "./textLayerStyleModal";
+import { SvgRasterExportModal } from "./svgRasterExportModal";
 
 /* ===== Collections (base-bound) ===== */
 export interface MarkerPreset {
@@ -177,6 +178,7 @@ export interface ZoomMapSettings {
   enableTextLayers?: boolean;
   travelTimePresets?: TravelTimePreset[];
   travelPerDay?: TravelPerDayConfig;
+  svgRasterMaxScale?: 2 | 4 | 8;
   
   // Session image cache
   enableSessionImageCache?: boolean;
@@ -313,6 +315,19 @@ export class MapInstance extends Component {
 
   // Session-cache tracking (per map instance)
   private acquiredSessionPaths: Set<string> = new Set<string>();
+  private baseIsSvg = false;
+  private svgRasterScale = 1; // actual bitmapWidth / logicalWidth for current baseSource
+
+  // Per-note SVG base raster cache (kept while note/tab stays open)
+  private svgBaseCache: Map<string, Map<number, ImageBitmap>> = new Map();
+  private svgUpgradeInFlight: Map<string, Map<number, Promise<ImageBitmap | null>>> = new Map();
+
+  // Safety cap (avoid extreme allocations)
+  private readonly svgRasterMaxSidePx = 8192;
+
+  private getSvgRasterMaxScale(): number {
+    return this.plugin.settings.svgRasterMaxScale ?? 8;
+  }
 
   // Text layers (character sheets)
   private textSvgWrap!: HTMLDivElement;
@@ -478,6 +493,105 @@ export class MapInstance extends Component {
     }
     return blocks;
   }
+  
+  private async upsertYamlMarkersPath(newMarkersPath: string): Promise<boolean> {
+    const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
+    if (!(af instanceof TFile)) return false;
+
+    let foundBlock = false;
+    let didChange = false;
+
+    await this.app.vault.process(af, (text) => {
+      const lines = text.split("\n");
+      const blk = this.findZoommapBlockForThisMap(lines);
+      if (!blk) return text;
+      foundBlock = true;
+
+      const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
+      const content = lines.slice(blk.start + 1, blk.end);
+
+      const keyRe = /^(\s*)markers\s*:\s*(.*)$/i;
+      let keyIdx = -1;
+      let keyIndent = "";
+      let keyPrefix = blkPrefix;
+
+      for (let i = 0; i < content.length; i++) {
+        const info = splitQuotePrefix(content[i]);
+        const m = keyRe.exec(info.rest);
+        if (m) {
+          keyIdx = i;
+          keyIndent = m[1] ?? "";
+          keyPrefix = info.prefix || blkPrefix;
+          break;
+        }
+      }
+
+      const newLine = `${keyPrefix}${keyIndent}markers: ${JSON.stringify(newMarkersPath)}`;
+      const out = content.slice();
+
+      if (keyIdx >= 0) {
+        if (out[keyIdx] !== newLine) {
+          out[keyIdx] = newLine;
+          didChange = true;
+        }
+      } else {
+        const indent = this.detectYamlKeyIndent(out);
+        out.push(`${blkPrefix}${indent}markers: ${JSON.stringify(newMarkersPath)}`);
+        didChange = true;
+      }
+
+      if (!didChange) return text;
+
+      return [
+        ...lines.slice(0, blk.start + 1),
+        ...out,
+        ...lines.slice(blk.end),
+      ].join("\n");
+    });
+
+    return foundBlock && didChange;
+  }
+
+  private computeMarkersPathForBase(basePath: string): string {
+    return normalizePath(`${basePath}.markers.json`);
+  }
+
+  private async ensureFolderForPath(path: string): Promise<void> {
+    const dir = normalizePath(path).split("/").slice(0, -1).join("/");
+    if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
+      await this.app.vault.createFolder(dir);
+    }
+  }
+
+  private async moveCurrentMarkersFileToBase(newBasePath: string): Promise<string> {
+    // only for json storage
+    if (this.cfg.storageMode !== "json") {
+      throw new Error("Cannot move markers.json when storage mode is 'note'.");
+    }
+
+    const oldMarkersPath = normalizePath(this.store.getPath());
+    const oldAf = this.app.vault.getAbstractFileByPath(oldMarkersPath);
+    if (!(oldAf instanceof TFile)) {
+      throw new Error(`Current markers.json not found: ${oldMarkersPath}`);
+    }
+
+    await this.saveDataSoon(); // flush any pending writes to the current store
+
+    const wanted = this.computeMarkersPathForBase(newBasePath);
+    await this.ensureFolderForPath(wanted);
+
+    // avoid collision
+    let finalPath = normalizePath(wanted);
+    const base = finalPath.slice(0, -".markers.json".length);
+    let i = 1;
+    while (this.app.vault.getAbstractFileByPath(finalPath)) {
+      finalPath = normalizePath(`${base}-${i}.markers.json`);
+      i++;
+    }
+
+    await this.app.vault.rename(oldAf, finalPath);
+    return finalPath;
+  }
 
   private readYamlScalarFromBlock(blockLines: string[], key: string): string | null {
     const re = new RegExp(`^\\s*${key}\\s*:\\s*(.+)\\s*$`, "i");
@@ -605,7 +719,7 @@ export class MapInstance extends Component {
     void this.applyViewEditorResult(res.config);
   });
   modal.open();
-}
+  }
 
   private applyInitialView(zoom: number, center: { x: number; y: number }): void {
     const z = clamp(zoom, this.cfg.minZoom, this.cfg.maxZoom);
@@ -652,211 +766,211 @@ export class MapInstance extends Component {
     };
   }
 
-private async saveDefaultViewToYaml(): Promise<void> {
-  const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
-  if (!(af instanceof TFile)) {
-    new Notice("Source note not found.", 2500);
-    return;
+  private async saveDefaultViewToYaml(): Promise<void> {
+    const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
+    if (!(af instanceof TFile)) {
+      new Notice("Source note not found.", 2500);
+      return;
+    }
+
+    const z = this.scale;
+    if (!this.imgW || !this.imgH || !Number.isFinite(z) || z <= 0) {
+      new Notice("Cannot store default view (image not ready).", 2500);
+      return;
+    }
+
+    const r = this.viewportEl.getBoundingClientRect();
+    const vw = r.width || this.vw || 1;
+    const vh = r.height || this.vh || 1;
+    const centerScreenX = vw / 2;
+    const centerScreenY = vh / 2;
+
+    const worldX = (centerScreenX - this.tx) / z;
+    const worldY = (centerScreenY - this.ty) / z;
+
+    const cx = Math.min(Math.max(worldX / this.imgW, 0), 1);
+    const cy = Math.min(Math.max(worldY / this.imgH, 0), 1);
+
+    const zoom = z;
+      let foundBlock = false;
+      let didChange = false;
+
+      await this.app.vault.process(af, (text) => {
+      const lines = text.split("\n");
+      const blk = this.findZoommapBlockForThisMap(lines);
+      if (!blk) return text;
+      foundBlock = true;
+	
+      const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
+
+      const content = lines.slice(blk.start + 1, blk.end);
+      const keyRe = /^(\s*)view\s*:/;
+      let keyIdx = -1;
+      let keyIndent = "";
+      let keyPrefix = blkPrefix;
+
+      for (let i = 0; i < content.length; i++) {
+        const info = splitQuotePrefix(content[i]);
+        const m = keyRe.exec(info.rest);
+        if (m) {
+          keyIdx = i;
+          keyIndent = m[1] ?? "";
+          keyPrefix = info.prefix || blkPrefix;
+          break;
+        }
+      }
+
+      const viewLines = [
+        `${keyPrefix}${keyIndent}view:`,
+        `${keyPrefix}${keyIndent}  zoom: ${zoom.toFixed(4)}`,
+        `${keyPrefix}${keyIndent}  centerX: ${cx.toFixed(6)}`,
+        `${keyPrefix}${keyIndent}  centerY: ${cy.toFixed(6)}`,
+      ];
+
+      const isNextTopLevelKey = (ln: string) => {
+        const rest = stripQuotePrefix(ln);
+        const trimmed = rest.trim();
+        if (!trimmed) return false;
+        if (trimmed.startsWith("#")) return false;
+        const spaces = (/^\s*/.exec(rest))?.[0].length ?? 0;
+        return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.test(trimmed);
+      };
+
+      let newContent: string[];
+
+      if (keyIdx >= 0) {
+        let end = keyIdx + 1;
+        while (end < content.length && !isNextTopLevelKey(content[end])) end++;
+
+        newContent = [
+          ...content.slice(0, keyIdx),
+          ...viewLines,
+          ...content.slice(end),
+        ];
+      } else {
+        const indent = this.detectYamlKeyIndent(content);
+        const pfx = blkPrefix;
+        const vLines = [
+          `${pfx}${indent}view:`,
+          `${pfx}${indent}  zoom: ${zoom.toFixed(4)}`,
+          `${pfx}${indent}  centerX: ${cx.toFixed(6)}`,
+          `${pfx}${indent}  centerY: ${cy.toFixed(6)}`,
+        ];
+        newContent = [...content, ...vLines];
+      }
+
+      if (newContent.join("\n") !== content.join("\n")) didChange = true;
+
+      return [
+        ...lines.slice(0, blk.start + 1),
+        ...newContent,
+        ...lines.slice(blk.end),
+      ].join("\n");
+    });
+
+      if (!foundBlock) {
+        new Notice("Could not locate zoommap block (embedded/callout?).", 3500);
+        return;
+      }
+      if (!didChange) {
+        new Notice("Default view unchanged (already up to date).", 2000);
+        return;
+      }
+      new Notice("Default view stored in YAML.", 2000);
   }
 
-  const z = this.scale;
-  if (!this.imgW || !this.imgH || !Number.isFinite(z) || z <= 0) {
-    new Notice("Cannot store default view (image not ready).", 2500);
-    return;
-  }
+  private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
 
-  const r = this.viewportEl.getBoundingClientRect();
-  const vw = r.width || this.vw || 1;
-  const vh = r.height || this.vh || 1;
-  const centerScreenX = vw / 2;
-  const centerScreenY = vh / 2;
+    const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
+    if (!(af instanceof TFile)) {
+      new Notice("Source note not found.", 3000);
+      return;
+    }
 
-  const worldX = (centerScreenX - this.tx) / z;
-  const worldY = (centerScreenY - this.ty) / z;
+    const buildYaml = (pluginCfg: ViewEditorConfig): string => this.plugin.buildYamlFromViewConfig(pluginCfg);
 
-  const cx = Math.min(Math.max(worldX / this.imgW, 0), 1);
-  const cy = Math.min(Math.max(worldY / this.imgH, 0), 1);
-
-  const zoom = z;
     let foundBlock = false;
     let didChange = false;
 
     await this.app.vault.process(af, (text) => {
-    const lines = text.split("\n");
-    const blk = this.findZoommapBlockForThisMap(lines);
-    if (!blk) return text;
-    foundBlock = true;
-	
-    const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
+      const lines = text.split("\n");
+      const blk = this.findZoommapBlockForThisMap(lines);
+      if (!blk) return text;
+      foundBlock = true;
 
-    const content = lines.slice(blk.start + 1, blk.end);
-    const keyRe = /^(\s*)view\s*:/;
-    let keyIdx = -1;
-    let keyIndent = "";
-    let keyPrefix = blkPrefix;
+      const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
 
-    for (let i = 0; i < content.length; i++) {
-      const info = splitQuotePrefix(content[i]);
-      const m = keyRe.exec(info.rest);
-      if (m) {
-        keyIdx = i;
-        keyIndent = m[1] ?? "";
-        keyPrefix = info.prefix || blkPrefix;
-        break;
+      // Parse existing YAML (so we can preserve keys that are NOT managed by the view editor, e.g. `view:`)
+      const existingObj = this.parseZoommapYamlFromBlock(lines, blk) ?? {};
+
+      // Parse new YAML (generated from the view editor modal)
+      const nextYamlStr = buildYaml(cfg);
+      let nextObj: Record<string, unknown> = {};
+      try {
+	    const parsed: unknown = parseYaml(nextYamlStr);
+        if (this.isPlainObject(parsed)) nextObj = parsed;
+      } catch {
+        // If parsing fails, fall back to full replace (old behavior)
+        nextObj = {};
       }
-    }
 
-    const viewLines = [
-      `${keyPrefix}${keyIndent}view:`,
-      `${keyPrefix}${keyIndent}  zoom: ${zoom.toFixed(4)}`,
-      `${keyPrefix}${keyIndent}  centerX: ${cx.toFixed(6)}`,
-      `${keyPrefix}${keyIndent}  centerY: ${cy.toFixed(6)}`,
-    ];
+      // Merge: keep unknown keys from existing, overwrite managed keys from next
+      const merged: Record<string, unknown> = { ...existingObj, ...nextObj };
 
-    const isNextTopLevelKey = (ln: string) => {
-      const rest = stripQuotePrefix(ln);
-      const trimmed = rest.trim();
-      if (!trimmed) return false;
-      if (trimmed.startsWith("#")) return false;
-      const spaces = (/^\s*/.exec(rest))?.[0].length ?? 0;
-      return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.test(trimmed);
-    };
+      // If a key is "managed" by the view editor and missing in nextObj, remove it from merged
+      // (e.g. user unticks "useWidth"/"useHeight" => width/height should be removed)
+      const managedKeys = [
+        "image",
+        "imageBases",
+        "imageOverlays",
+        "markers",
+        "markerLayers",
+        "minZoom",
+        "maxZoom",
+        "wrap",
+        "responsive",
+        "width",
+        "height",
+        "resizable",
+        "resizeHandle",
+        "render",
+        "align",
+        "id",
+        "viewportFrame",
+        "viewportFrameInsets",
+      ] as const;
 
-    let newContent: string[];
+      for (const k of managedKeys) {
+        if (!(k in nextObj) && k in merged) {
+          delete merged[k];
+        }
+      }
 
-    if (keyIdx >= 0) {
-      let end = keyIdx + 1;
-      while (end < content.length && !isNextTopLevelKey(content[end])) end++;
+      const mergedYamlStr = stringifyYaml(merged).trimEnd();
+      const yamlLinesRaw = mergedYamlStr.split("\n");
+      const yamlLines = blkPrefix ? yamlLinesRaw.map((ln) => `${blkPrefix}${ln}`) : yamlLinesRaw;
 
-      newContent = [
-        ...content.slice(0, keyIdx),
-        ...viewLines,
-        ...content.slice(end),
-      ];
-    } else {
-      const indent = this.detectYamlKeyIndent(content);
-      const pfx = blkPrefix;
-      const vLines = [
-        `${pfx}${indent}view:`,
-        `${pfx}${indent}  zoom: ${zoom.toFixed(4)}`,
-        `${pfx}${indent}  centerX: ${cx.toFixed(6)}`,
-        `${pfx}${indent}  centerY: ${cy.toFixed(6)}`,
-      ];
-      newContent = [...content, ...vLines];
-    }
+      const before = lines.slice(blk.start + 1, blk.end).join("\n");
+      const after = yamlLines.join("\n");
+      if (before !== after) didChange = true;
 
-    if (newContent.join("\n") !== content.join("\n")) didChange = true;
-
-    return [
-      ...lines.slice(0, blk.start + 1),
-      ...newContent,
-      ...lines.slice(blk.end),
-    ].join("\n");
-  });
+      return [
+        ...lines.slice(0, blk.start + 1),
+        ...yamlLines,
+        ...lines.slice(blk.end),
+      ].join("\n");
+    });
 
     if (!foundBlock) {
       new Notice("Could not locate zoommap block (embedded/callout?).", 3500);
       return;
     }
     if (!didChange) {
-      new Notice("Default view unchanged (already up to date).", 2000);
+      new Notice("No changes to apply.", 2000);
       return;
     }
-    new Notice("Default view stored in YAML.", 2000);
-}
-
-private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
-
-  const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
-  if (!(af instanceof TFile)) {
-    new Notice("Source note not found.", 3000);
-    return;
+    new Notice("View updated.", 2500);
   }
-
-  const buildYaml = (pluginCfg: ViewEditorConfig): string => this.plugin.buildYamlFromViewConfig(pluginCfg);
-
-  let foundBlock = false;
-  let didChange = false;
-
-  await this.app.vault.process(af, (text) => {
-    const lines = text.split("\n");
-    const blk = this.findZoommapBlockForThisMap(lines);
-    if (!blk) return text;
-    foundBlock = true;
-
-    const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
-
-    // Parse existing YAML (so we can preserve keys that are NOT managed by the view editor, e.g. `view:`)
-    const existingObj = this.parseZoommapYamlFromBlock(lines, blk) ?? {};
-
-    // Parse new YAML (generated from the view editor modal)
-    const nextYamlStr = buildYaml(cfg);
-    let nextObj: Record<string, unknown> = {};
-    try {
-	  const parsed: unknown = parseYaml(nextYamlStr);
-      if (this.isPlainObject(parsed)) nextObj = parsed;
-    } catch {
-      // If parsing fails, fall back to full replace (old behavior)
-      nextObj = {};
-    }
-
-    // Merge: keep unknown keys from existing, overwrite managed keys from next
-    const merged: Record<string, unknown> = { ...existingObj, ...nextObj };
-
-    // If a key is "managed" by the view editor and missing in nextObj, remove it from merged
-    // (e.g. user unticks "useWidth"/"useHeight" => width/height should be removed)
-    const managedKeys = [
-      "image",
-      "imageBases",
-      "imageOverlays",
-      "markers",
-      "markerLayers",
-      "minZoom",
-      "maxZoom",
-      "wrap",
-      "responsive",
-      "width",
-      "height",
-      "resizable",
-      "resizeHandle",
-      "render",
-      "align",
-      "id",
-      "viewportFrame",
-      "viewportFrameInsets",
-    ] as const;
-
-    for (const k of managedKeys) {
-      if (!(k in nextObj) && k in merged) {
-        delete merged[k];
-      }
-    }
-
-    const mergedYamlStr = stringifyYaml(merged).trimEnd();
-    const yamlLinesRaw = mergedYamlStr.split("\n");
-    const yamlLines = blkPrefix ? yamlLinesRaw.map((ln) => `${blkPrefix}${ln}`) : yamlLinesRaw;
-
-    const before = lines.slice(blk.start + 1, blk.end).join("\n");
-    const after = yamlLines.join("\n");
-    if (before !== after) didChange = true;
-
-    return [
-      ...lines.slice(0, blk.start + 1),
-      ...yamlLines,
-      ...lines.slice(blk.end),
-    ].join("\n");
-  });
-
-  if (!foundBlock) {
-    new Notice("Could not locate zoommap block (embedded/callout?).", 3500);
-    return;
-  }
-  if (!didChange) {
-    new Notice("No changes to apply.", 2000);
-    return;
-  }
-  new Notice("View updated. Reload the note to see changes.", 2500);
-}
   
   private tintedSvgCache: Map<string, string> = new Map<string, string>();
   
@@ -1025,6 +1139,12 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
 
   private isCanvas(): boolean { return this.cfg.renderMode === "canvas"; }
 
+  private updateSvgBaseFlag(path: string): void {
+    const isSvg = typeof path === "string" && path.toLowerCase().endsWith(".svg");
+    this.baseIsSvg = isSvg;
+    this.el.classList.toggle("zm-root--svg-base", isSvg);
+  }
+
   onload(): void {
     void this.bootstrap().catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1044,6 +1164,16 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
     this.calloutMo?.disconnect();
     this.closeMenu();
     this.disposeBitmaps();
+	
+    // Close per-note SVG raster cache bitmaps (only exist when base svg + canvas)
+    for (const byLod of this.svgBaseCache.values()) {
+      for (const bmp of byLod.values()) {
+        try { bmp.close(); } catch { /* ignore */ }
+      }
+      byLod.clear();
+    }
+    this.svgBaseCache.clear();
+    this.svgUpgradeInFlight.clear();
   }
   
   private collectAncestorCallouts(): HTMLElement[] {
@@ -1415,6 +1545,20 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
   }
 
   private async loadBaseSourceByPath(path: string): Promise<void> {
+    this.updateSvgBaseFlag(path);
+
+    // Canvas + SVG base: progressive LOD.
+    // Start with 1× quickly, then upgrade on demand during zoom.
+    if (this.isCanvas() && this.baseIsSvg) {
+      const bmp1 = await this.ensureSvgLod(path, 1);
+      if (!bmp1) throw new Error(`Failed to load SVG base: ${path}`);
+
+      this.baseSource = bmp1;
+      this.svgRasterScale = bmp1.width / this.imgW;
+      this.currentBasePath = path;
+      return;
+    }
+
     const cache = this.plugin.imageCache;
     if (cache) {
       const f = this.resolveTFile(path, this.cfg.sourcePath);
@@ -1454,6 +1598,7 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
   }
 
   private async loadBaseImageByPath(path: string): Promise<void> {
+    this.updateSvgBaseFlag(path);
     const imgFile = this.resolveTFile(path, this.cfg.sourcePath);
     if (!imgFile) throw new Error(`Image not found: ${path}`);
     const url = this.app.vault.getResourcePath(imgFile);
@@ -1466,6 +1611,7 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
   }
 
   private async loadInitialBase(path: string): Promise<void> {
+	this.updateSvgBaseFlag(path);
     if (this.isCanvas()) await this.loadBaseSourceByPath(path);
     else await this.loadBaseImageByPath(path);
   }
@@ -1489,6 +1635,160 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
 	} catch {
        return img;
 	}
+  }
+  
+  private clampRasterDims(w: number, h: number): { w: number; h: number; clamped: boolean } {
+    let clamped = false;
+    let W = Math.max(1, Math.round(w));
+    let H = Math.max(1, Math.round(h));
+
+    const maxSide = this.svgRasterMaxSidePx;
+    if (W > maxSide || H > maxSide) {
+      clamped = true;
+      const k = Math.min(maxSide / W, maxSide / H);
+      W = Math.max(1, Math.round(W * k));
+      H = Math.max(1, Math.round(H * k));
+    }
+    return { w: W, h: H, clamped };
+  }
+
+  private getSvgCache(path: string): Map<number, ImageBitmap> {
+    let byLod = this.svgBaseCache.get(path);
+    if (!byLod) {
+      byLod = new Map();
+      this.svgBaseCache.set(path, byLod);
+    }
+    return byLod;
+  }
+
+  private getSvgInflight(path: string): Map<number, Promise<ImageBitmap | null>> {
+    let byLod = this.svgUpgradeInFlight.get(path);
+    if (!byLod) {
+      byLod = new Map();
+      this.svgUpgradeInFlight.set(path, byLod);
+    }
+    return byLod;
+  }
+  
+  private evictSvgLods(path: string, keep: number[]): void {
+    const byLod = this.svgBaseCache.get(path);
+    if (!byLod) return;
+
+    for (const [lod, bmp] of byLod.entries()) {
+      if (keep.includes(lod)) continue;
+      try {
+        bmp.close();
+      } catch {
+        // ignore
+      }
+      byLod.delete(lod);
+    }
+  }  
+
+  private pickDesiredSvgLod(scale: number): number {
+    // LOD strategy:
+    // - always start with 1× (fast)
+    // - first meaningful zoom-in triggers 2×
+    // - higher zoom triggers 4×
+    // - optionally 8× if allowed by settings and zoom is very high
+    const max = this.getSvgRasterMaxScale();
+
+    if (scale < 1.35) return 1;
+    if (scale < 2.8) return Math.min(2, max);
+    if (scale < 5.6) return Math.min(4, max);
+    return Math.min(8, max);
+  }
+
+  private async loadSvgBitmapAtLod(path: string, lod: number): Promise<ImageBitmap | null> {
+    const f = this.resolveTFile(path, this.cfg.sourcePath);
+    if (!f) return null;
+
+    const url = this.app.vault.getResourcePath(f);
+    const img = new Image();
+    img.decoding = "async";
+    img.src = url;
+    try { await img.decode(); } catch { /* ignore */ }
+
+    const logicalW = img.naturalWidth || 0;
+    const logicalH = img.naturalHeight || 0;
+    if (logicalW <= 0 || logicalH <= 0) return null;
+
+    // keep logical size stable
+    this.imgW = logicalW;
+    this.imgH = logicalH;
+
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const targetW = logicalW * lod * dpr;
+    const targetH = logicalH * lod * dpr;
+    const dims = this.clampRasterDims(targetW, targetH);
+
+    try {
+      const opts: ImageBitmapOptions = {
+        resizeWidth: dims.w,
+        resizeHeight: dims.h,
+        resizeQuality: "high",
+      };
+
+      const bmp = await createImageBitmap(img, opts);
+      return bmp;
+    } catch {
+      try { return await createImageBitmap(img); } catch { return null; }
+    }
+  }
+
+  private async ensureSvgLod(path: string, lod: number): Promise<ImageBitmap | null> {
+    const byLod = this.getSvgCache(path);
+    const cached = byLod.get(lod);
+    if (cached) return cached;
+
+    const inflight = this.getSvgInflight(path);
+    const running = inflight.get(lod);
+    if (running) return running;
+
+    const p = this.loadSvgBitmapAtLod(path, lod)
+      .then((bmp) => {
+        inflight.delete(lod);
+        if (bmp) byLod.set(lod, bmp);
+        return bmp;
+      })
+      .catch(() => {
+        inflight.delete(lod);
+        return null;
+      });
+
+    inflight.set(lod, p);
+    return p;
+  }
+
+  private async maybeUpgradeSvgBaseForCurrentZoom(): Promise<void> {
+    if (!this.isCanvas()) return;
+    if (!this.baseIsSvg) return;
+    const path = this.currentBasePath ?? this.getActiveBasePath();
+    if (!path) return;
+
+    const desired = this.pickDesiredSvgLod(this.scale);
+    const byLod = this.getSvgCache(path);
+
+    // find best currently available <= desired (prefer higher)
+    const have = [8,4,2,1].find((l) => byLod.has(l)) ?? 0;
+    if (have >= desired) return;
+
+    // Start async build for desired LOD, keep current visible
+    const bmp = await this.ensureSvgLod(path, desired);
+    if (!bmp) return;
+
+    // Swap current baseSource to the new bitmap (no marker drift: draw into logical imgW/imgH)
+    this.baseSource = bmp;
+    this.svgRasterScale = bmp.width / this.imgW;
+	
+    // Memory policy (as requested): keep only the highest/current LOD for this base.
+    // This avoids frequent LOD switching when zooming in/out and saves memory.
+    this.evictSvgLods(path, [desired]);
+
+    if (this.ready) {
+      this.renderCanvas();
+      this.renderMarkersOnly();
+    }
   }
 
   private closeCanvasSource(src: CanvasImageSource | null): void {
@@ -1585,7 +1885,17 @@ private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = this.scale < 0.18 ? "low" : "medium";
 
-    ctx.drawImage(this.baseSource, 0, 0);
+    if (this.baseIsSvg && this.baseSource instanceof ImageBitmap) {
+      const srcW = this.baseSource.width;
+      const srcH = this.baseSource.height;
+      if (srcW !== this.imgW || srcH !== this.imgH) {
+        ctx.drawImage(this.baseSource, 0, 0, srcW, srcH, 0, 0, this.imgW, this.imgH);
+      } else {
+        ctx.drawImage(this.baseSource, 0, 0);
+      }
+    } else {
+      ctx.drawImage(this.baseSource, 0, 0);
+    }
 
     if (this.data?.overlays?.length) {
       for (const o of this.data.overlays) {
@@ -4105,6 +4415,20 @@ private onContextMenuViewport(e: MouseEvent): void {
 	  { label: "Base", children: baseItems },
 	  { label: "Overlays", children: overlayItems },
 	];
+	
+    // Only offer raster export if the active base is an SVG
+    if (this.isActiveBaseSvg()) {
+      imageLayersChildren.push(
+        { type: "separator" },
+        {
+          label: "Export active SVG base as WebP…",
+          action: () => {
+            this.closeMenu();
+            this.openSvgExportModal();
+          },
+        },
+      );
+    }	
 
 	if (this.plugin.settings.enableDrawing) {
 	  imageLayersChildren.push({
@@ -4540,6 +4864,26 @@ if (this.plugin.settings.enableTextLayers && this.data) {
         },
       );
     }
+	
+    // ---- Distance info line (non-interactive) ----
+    // Only show it if there is an actual measurement (>= 2 points incl. preview).
+    {
+      const ptsCount =
+        this.measurePts.length +
+        (this.measuring && this.measurePreview ? 1 : 0);
+
+      if (ptsCount >= 2) {
+        const mpp = this.getMetersPerPixel();
+        const meters = this.computeDistanceMeters();
+
+        const distLabel =
+          !mpp || meters == null
+            ? "Distance: (no scale)"
+            : `Distance: ${this.formatDistance(meters)}`;
+
+        items.push({ type: "separator" }, { label: distLabel });
+      }
+    }
 
     this.openMenu = new ZMMenu(this.el.ownerDocument);
     this.openMenu.open(e.clientX, e.clientY, items);
@@ -4574,6 +4918,198 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     if (this.openMenu) {
       this.openMenu.destroy();
       this.openMenu = null;
+    }
+  }
+  
+  private isActiveBaseSvg(): boolean {
+    const p = this.getActiveBasePath();
+    return typeof p === "string" && p.toLowerCase().endsWith(".svg");
+  }
+
+  private async getSvgIntrinsicSize(svgPath: string): Promise<{ w: number; h: number } | null> {
+    const af = this.app.vault.getAbstractFileByPath(svgPath);
+    if (!(af instanceof TFile)) return null;
+
+    try {
+      const raw = await this.app.vault.read(af);
+      const doc = new DOMParser().parseFromString(raw, "image/svg+xml");
+      const el = doc.querySelector("svg");
+      if (!el) return null;
+
+      const wAttr = el.getAttribute("width") ?? "";
+      const hAttr = el.getAttribute("height") ?? "";
+      const vbAttr = el.getAttribute("viewBox") ?? "";
+
+      const parseLen = (s: string) => {
+        const m = /^([0-9.+-eE]+)\s*(px)?\s*$/.exec(s.trim());
+        if (!m) return Number.NaN;
+        return Number(m[1]);
+      };
+
+      const w = parseLen(wAttr);
+      const h = parseLen(hAttr);
+      if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+        return { w, h };
+      }
+
+      // viewBox: minX minY width height
+      const vb = vbAttr.trim().split(/[\s,]+/).map((x) => Number(x));
+      if (vb.length === 4 && vb.every((n) => Number.isFinite(n))) {
+        const vw = vb[2];
+        const vh = vb[3];
+        if (vw > 0 && vh > 0) return { w: vw, h: vh };
+      }
+    } catch {
+      // ignore
+    }
+
+    return null;
+  }
+
+  private async exportActiveSvgBaseToWebp(longEdge: number, quality: number, outPath: string): Promise<string> {
+    const svgPath = this.getActiveBasePath();
+    if (!svgPath.toLowerCase().endsWith(".svg")) {
+      throw new Error("Active base is not an SVG.");
+    }
+
+    const f = this.resolveTFile(svgPath, this.cfg.sourcePath);
+    if (!f) throw new Error(`SVG not found: ${svgPath}`);
+
+    const url = this.app.vault.getResourcePath(f);
+
+    const img = new Image();
+    img.decoding = "async";
+    img.src = url;
+    try { await img.decode(); } catch { /* ignore */ }
+
+    let w0 = img.naturalWidth || 0;
+    let h0 = img.naturalHeight || 0;
+
+    if (w0 <= 0 || h0 <= 0) {
+      const intrinsic = await this.getSvgIntrinsicSize(svgPath);
+      if (!intrinsic) {
+        throw new Error("SVG has no intrinsic size (missing width/height and viewBox).");
+      }
+      w0 = intrinsic.w;
+      h0 = intrinsic.h;
+    }
+
+    const scale = longEdge / Math.max(w0, h0);
+    const w = Math.max(1, Math.round(w0 * scale));
+    const h = Math.max(1, Math.round(h0 * scale));
+
+    // Safety guard (avoid gigantic allocations).
+    // 12k long edge is expected; this prevents accidental extremes.
+    const maxSide = 16384;
+    if (w > maxSide || h > maxSide) {
+      throw new Error(`Target size too large (${w}×${h}). Try 8k.`);
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("No canvas context.");
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+
+    const q = Math.min(1, Math.max(0.1, quality));
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (b) => (b ? resolve(b) : reject(new Error("toBlob failed"))),
+        "image/webp",
+        q,
+      );
+    });
+
+    // Ensure output folder exists
+    const dir = outPath.split("/").slice(0, -1).join("/");
+    if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
+      await this.app.vault.createFolder(dir);
+    }
+
+    // If exists, add suffix
+    let finalPath = normalizePath(outPath);
+    const lower = finalPath.toLowerCase();
+    const base = lower.endsWith(".webp") ? finalPath.slice(0, -5) : finalPath;
+    let i = 1;
+    while (this.app.vault.getAbstractFileByPath(finalPath)) {
+      finalPath = normalizePath(`${base}-${i}.webp`);
+      i++;
+    }
+
+    // Desktop-only adapter API
+    // @ts-expect-error writeBinary exists on desktop adapters
+    await this.app.vault.adapter.writeBinary(finalPath, await blob.arrayBuffer());
+
+    return finalPath;
+  }
+
+  private openSvgExportModal(): void {
+    if (!this.data) return;
+    const svgPath = this.getActiveBasePath();
+    if (!svgPath.toLowerCase().endsWith(".svg")) return;
+
+    new SvgRasterExportModal(
+      this.app,
+      {
+        svgPath,
+        sourcePath: this.cfg.sourcePath,
+        defaultLongEdge: 8192,
+        defaultQuality: 0.92,
+      },
+      (res) => { void this.handleSvgExportResult(res); },
+    ).open();
+  }
+  
+  private async handleSvgExportResult(res: { action: "export" | "cancel"; result?: import("./svgRasterExportModal").SvgRasterExportResult }): Promise<void> {
+    if (res.action !== "export" || !res.result) return;
+
+    try {
+      new Notice("Exporting SVG… (this may take a moment)", 4000);
+
+      const out = await this.exportActiveSvgBaseToWebp(
+        res.result.longEdge,
+        res.result.quality,
+        res.result.outPath,
+      );
+
+      // Add as new base + activate
+      await this.addBaseByPath(out, res.result.baseName);
+      await this.setActiveBase(out);
+
+      // Optional: move/rename markers.json to match the exported base
+      if (res.result.moveMarkersJson) {
+        if (this.cfg.storageMode !== "json") {
+          new Notice("Cannot move markers.json when storage mode is 'note'.", 6000);
+        } else {
+          // Ensure the current marker data is saved (setActiveBase triggers saveDataSoon internally)
+          await this.saveDataSoon();
+
+          const newMarkersPath = await this.moveCurrentMarkersFileToBase(out);
+
+          // Switch runtime store to the new markers path
+          this.cfg.markersPath = newMarkersPath;
+          this.store = new MarkerStore(this.app, this.cfg.sourcePath, newMarkersPath);
+
+          const ok = await this.upsertYamlMarkersPath(newMarkersPath);
+          if (!ok) {
+            new Notice("Exported and moved markers.json, but YAML could not be updated.", 6000);
+          } else {
+            new Notice(
+              "Markers.json moved to the exported base. Important: other maps using the old markers.json must be updated manually.",
+              9000,
+            );
+          }
+        }
+      }
+
+      new Notice(`Exported: ${out}`, 3000);
+    } catch (e) {
+      console.error(e);
+      new Notice(`SVG export failed: ${e instanceof Error ? e.message : String(e)}`, 6000);
     }
   }
 
@@ -4626,14 +5162,17 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     this.tx = txr;
     this.ty = tyr;
 
-    this.worldEl.style.transform =
-      `translate3d(${this.tx}px, ${this.ty}px, 0) scale3d(${this.scale}, ${this.scale}, 1)`;
+	this.worldEl.style.transform =
+	  `translate3d(${this.tx}px, ${this.ty}px, 0) scale3d(${this.scale}, ${this.scale}, 1)`;
 
     if (render) {
       if (prevScale !== s) {
         this.showZoomHud();
         this.updateMarkerInvScaleOnly();
         this.updateMarkerZoomVisibilityOnly();
+        // If SVG base: kick off async raster upgrade after zoom changes.
+        // Keep current bitmap visible; swap when ready.
+        void this.maybeUpgradeSvgBaseForCurrentZoom();
       }
       this.renderMeasure();
       this.renderCalibrate();
@@ -6488,6 +7027,8 @@ if (this.plugin.settings.enableTextLayers && this.data) {
   private async setActiveBase(path: string): Promise<void> {
     if (!this.data) return;
     if (this.currentBasePath === path && this.imgW > 0 && this.imgH > 0) return;
+	
+    this.updateSvgBaseFlag(path);
 
     this.data.activeBase = path;
     this.data.image = path;
@@ -7520,6 +8061,10 @@ class ZMMenu {
           if (it.markColor) chk.style.color = it.markColor;
         } else if (typeof it.checked === "boolean") {
           chk.setText(it.checked ? "✓" : "");
+        }
+
+        if (!it.action) {
+          row.classList.add("zm-menu__item--info");
         }
 
         row.addEventListener("click", () => {

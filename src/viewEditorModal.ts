@@ -287,6 +287,7 @@ export class ViewEditorModal extends Modal {
     new Setting(contentEl)
       .setClass("zoommap-view-editor-row")
       .setName("Render mode")
+	  .setDesc("Prefer canvas for larger SVG maps.",)
       .addDropdown((d) => {
         d.addOption("dom", "DOM");
         d.addOption("canvas", "Canvas");
@@ -373,7 +374,7 @@ export class ViewEditorModal extends Modal {
 	  setIcon(hint, "info");
 	  hint.setAttr(
 		"title",
-		"Check to store width in YAML. Leave unchecked to let the map remember its size in markers.json only.",
+		"Check to store a fixed width in YAML. Leave both unchecked to resize the map freely; each new size will be saved automatically in markers.json.",
 	  );
 	}
 
@@ -403,7 +404,7 @@ export class ViewEditorModal extends Modal {
 	  setIcon(hint, "info");
 	  hint.setAttr(
 		"title",
-		"Check to store height in YAML. Leave unchecked to let the map remember its height in markers.json only.",
+		"Check to store a fixed height in YAML. Leave both unchecked to resize the map freely; each new size will be saved automatically in markers.json.",
 	  );
 	}
 

@@ -2,7 +2,7 @@
 
 This Map tool lets you embed an image as an interactive, zoomable map inside Obsidian and place markers, stickers, drawings, measurements, HUD pins and (optionally) editable text layers on top.
 
-Joshua Plunkett (obsidianttrpgtutorials.com) made a video about it. It’s a bit outdated, so I’d still recommend checking the README.
+Joshua Plunkett (obsidianttrpgtutorials.com) made a video about it. Due to ongoing development, I recommend checking the README also.
 [![Watch video](assets/maxresdefault.jpg)](https://youtu.be/rB4MCgl44lU)
 
 ## Features
@@ -58,11 +58,16 @@ Joshua Plunkett (obsidianttrpgtutorials.com) made a video about it. It’s a bit
 ### Render modes
 - DOM (default)
 - Canvas render mode for weaker devices (tablets/mobile)
+ - Prefer Canvas for larger SVG maps it stutters in DOM mode
 
 ### Storage
 - Default: JSON marker file beside the image: `<image>.markers.json`
 - Optional inline storage inside the note (`storage: note`)
 - Writes are throttled and only saved when content actually changed
+
+### SVG maps
+- You can export your SVG maps to WebP in 2k, 4k, 8k and 12k.
+ - When you export to 12k it takes about 20-30 seconds on high end systems so be patient.
 
 ---
 

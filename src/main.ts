@@ -136,7 +136,8 @@ const DEFAULT_SETTINGS: ZoomMapSettingsExtended = {
   enableSessionImageCache: false,
   sessionImageCacheMb: 512,
   keepOverlaysLoaded: false,
-  preferCanvasImagesWhenCaching: false,  
+  preferCanvasImagesWhenCaching: false, 
+  svgRasterMaxScale: 8,
 };
 
 /* ---------------- YAML parsing helpers ---------------- */
@@ -194,7 +195,6 @@ interface YamlOptions {
     bottom?: number | string;
     left?: number | string;
   };
-
 }
 
 function parseBasesYaml(v: unknown): YamlBase[] {
@@ -506,8 +506,14 @@ export default class ZoomMapPlugin extends Plugin {
           !!this.settings.enableSessionImageCache &&
           !!this.settings.preferCanvasImagesWhenCaching;
 
+        const yamlRender =
+          typeof opts.render === "string" ? opts.render.trim().toLowerCase() : "";
+
         const renderMode: "dom" | "canvas" =
-          preferCanvas ? "canvas" : (opts.render === "canvas" ? "canvas" : "dom");
+          yamlRender === "canvas" ? "canvas"
+          : yamlRender === "dom" ? "dom"
+          : preferCanvas ? "canvas"
+          : "dom";
 
         let image = typeof opts.image === "string" ? opts.image.trim() : "";
         if (!image && yamlBases.length > 0) image = yamlBases[0].path;
@@ -684,7 +690,8 @@ export default class ZoomMapPlugin extends Plugin {
     this.settings.enableSessionImageCache ??= false;
     this.settings.sessionImageCacheMb ??= 512;
     this.settings.keepOverlaysLoaded ??= false;
-    this.settings.preferCanvasImagesWhenCaching ??= false;	
+    this.settings.preferCanvasImagesWhenCaching ??= false;
+	this.settings.svgRasterMaxScale ??= 8;
   }
 
   async saveSettings(): Promise<void> {
@@ -920,7 +927,7 @@ export default class ZoomMapPlugin extends Plugin {
 
     obj.resizable = !!cfg.resizable;
     obj.resizeHandle = cfg.resizeHandle;
-    if (cfg.renderMode === "canvas") obj.render = "canvas";
+    obj.render = cfg.renderMode;
     if (cfg.align) obj.align = cfg.align;
 
     if (cfg.id && cfg.id.trim().length > 0) {

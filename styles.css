@@ -199,6 +199,18 @@
   transform: translateZ(0);
 }
 
+/* SVG base image quality mode */
+.zm-root--svg-base .zm-world {
+  will-change: auto;
+}
+
+.zm-root--svg-base .zm-image,
+.zm-root--svg-base .zm-overlay-image {
+  transform: none !important; /* override translateZ(0) */
+  backface-visibility: visible;
+  -webkit-backface-visibility: visible;
+}
+
 /* Overlays and markers */
 .zm-overlays {
   position: absolute;
@@ -444,6 +456,16 @@
 
 .zm-menu__item:hover {
   background: var(--background-modifier-hover);
+}
+
+/* Non-interactive info rows in the menu (e.g. Distance line) */
+.zm-menu__item.zm-menu__item--info {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.zm-menu__item.zm-menu__item--info:hover {
+  background: transparent;
 }
 
 .zm-menu__label {
