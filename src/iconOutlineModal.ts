@@ -192,8 +192,8 @@ export class IconOutlineModal extends Modal {
     width: number,
     opacity: number,
   ): string {
-    // First enlarge the viewBox so the outline is not clipped.
-    let s = this.expandViewBoxForStroke(svg, width);
+    let s = this.removeExistingZmOutline(svg);
+    s = this.applyViewBoxPaddingFromOriginal(s, width);
 
     const openMatch = /<svg[^>]*>/i.exec(s);
     const closeIndex = s.lastIndexOf("</svg>");
@@ -223,6 +223,61 @@ export class IconOutlineModal extends Modal {
     return s.slice(0, openEnd) + newInner + s.slice(closeIndex);
   }
   
+  private removeExistingZmOutline(svg: string): string {
+    try {
+      const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+      const svgEl = doc.querySelector("svg");
+      if (!svgEl) return svg;
+
+      const oldOutline = svgEl.querySelector("#zm-outline");
+      oldOutline?.remove();
+
+      const oldInner = svgEl.querySelector("#zm-inner");
+      if (oldInner) {
+        const frag = doc.createDocumentFragment();
+        while (oldInner.firstChild) frag.appendChild(oldInner.firstChild);
+        oldInner.replaceWith(frag);
+      }
+
+      return new XMLSerializer().serializeToString(svgEl);
+    } catch {
+      return svg;
+    }
+  }
+
+  private applyViewBoxPaddingFromOriginal(svg: string, strokeWidth: number): string {
+    try {
+      const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+      const svgEl = doc.querySelector("svg");
+      if (!svgEl) return svg;
+
+      const orig = svgEl.getAttribute("data-zm-orig-viewbox") ?? svgEl.getAttribute("viewBox");
+      if (!orig) return svg;
+
+      if (!svgEl.getAttribute("data-zm-orig-viewbox")) {
+        svgEl.setAttribute("data-zm-orig-viewbox", orig);
+      }
+
+      const parts = orig.trim().split(/[\s,]+/).map((x) => Number(x));
+      if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) return svg;
+
+      const [minX, minY, w, h] = parts;
+      if (w <= 0 || h <= 0) return svg;
+
+      const pad = strokeWidth * 2;
+      const newMinX = minX - pad;
+      const newMinY = minY - pad;
+      const newW = w + pad * 2;
+      const newH = h + pad * 2;
+
+      svgEl.setAttribute("viewBox", `${newMinX} ${newMinY} ${newW} ${newH}`);
+
+      return new XMLSerializer().serializeToString(svgEl);
+    } catch {
+      return svg;
+    }
+  }
+  
   private stripFillAndStrokeForOutline(src: string): string {
     let s = src;
 
@@ -248,41 +303,6 @@ export class IconOutlineModal extends Modal {
     });
 
     return s;
-  }
-
-  private expandViewBoxForStroke(svg: string, strokeWidth: number): string {
-    const m = /viewBox="\s*([0-9.+\-eE]+)\s+([0-9.+\-eE]+)\s+([0-9.+\-eE]+)\s+([0-9.+\-eE]+)\s*"/i.exec(
-      svg,
-    );
-    if (!m) return svg;
-
-    const minX = Number(m[1]);
-    const minY = Number(m[2]);
-    const width = Number(m[3]);
-    const height = Number(m[4]);
-
-    if (
-      !Number.isFinite(minX) ||
-      !Number.isFinite(minY) ||
-      !Number.isFinite(width) ||
-      !Number.isFinite(height) ||
-      width <= 0 ||
-      height <= 0
-    ) {
-      return svg;
-    }
-
-    const pad = strokeWidth * 2;
-
-    const newMinX = minX - pad;
-    const newMinY = minY - pad;
-    const newWidth = width + pad * 2;
-    const newHeight = height + pad * 2;
-
-    const oldAttr = m[0];
-    const newAttr = `viewBox="${newMinX} ${newMinY} ${newWidth} ${newHeight}"`;
-
-    return svg.replace(oldAttr, newAttr);
   }
 
   private normalizeHex(v: string): string {

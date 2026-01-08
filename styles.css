@@ -1,3 +1,100 @@
+/* Settings: optional image-icon preview column */
+.zoommap-settings.zoommap-settings--imgpreview .zm-icons-grid-head--img,
+.zoommap-settings.zoommap-settings--imgpreview .zm-icons-grid--img {
+  grid-template-columns: 12ch 36px minmax(220px, 1fr) 7ch 7ch 7ch 7ch 36px;
+}
+
+.zoommap-settings.zoommap-settings--imgpreview .zoommap-settings__icon-preview--img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+}
+
+/* Path field smaller when preview is enabled (most people use the picker anyway) */
+.zoommap-settings.zoommap-settings--imgpreview .zoommap-settings__icon-path-input {
+  width: 24ch;
+  min-width: 12ch;
+}
+
+/* =======================
+   Wider modals (collections, travel rules, etc.)
+   ======================= */
+.modal.zoommap-modal--wide {
+  width: min(1200px, 92vw);
+  max-width: 92vw;
+}
+.modal.zoommap-modal--wide .modal-content {
+  max-width: 100%;
+}
+
+/* Travel rules manager row (packs) */
+.zoommap-travel-pack-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.zoommap-travel-pack-enabled {
+  margin: 0 6px 0 0;
+}
+
+.zoommap-travel-pack-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+  white-space: nowrap;
+}
+
+/* Smaller "Export" button in manager */
+button.zm-btn-sm {
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+
+/* Travel pack editor: compact unit inputs (only inside this modal) */
+.modal.zoommap-modal--travel .zoommap-custom-unit-row {
+  grid-template-columns: 20ch 5ch 9ch auto;
+  gap: 8px;
+}
+
+.modal.zoommap-modal--travel .zoommap-custom-unit-row .zm-cu-abbr {
+  width: 5ch;
+}
+
+.modal.zoommap-modal--travel .zoommap-custom-unit-row .zm-cu-factor {
+  width: 9ch;
+}
+
+/* Travel presets grid in travel modal: make unit/time-unit tighter */
+.modal.zoommap-modal--travel .zm-travel-grid-head,
+.modal.zoommap-modal--travel .zm-travel-grid {
+  display: grid;
+  grid-template-columns: 18ch 6ch 7ch 6ch 5ch 64px;
+  gap: 10px;
+  align-items: center;
+}
+
+.modal.zoommap-modal--travel input.zm-travel-name { width: 18ch; }
+.modal.zoommap-modal--travel input.zm-travel-num { width: 6ch; }
+.modal.zoommap-modal--travel select.zm-travel-unit { width: 7ch; }
+.modal.zoommap-modal--travel input.zm-travel-timeunit { width: 5ch; }
+
+.modal.zoommap-modal--travel .zm-travel-grid-head span {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.modal.zoommap-modal--travel .zm-travel-grid input,
+.modal.zoommap-modal--travel .zm-travel-grid select {
+  min-width: 0;
+}
+
 /* Root and viewport */
 .zm-root {
   box-sizing: border-box;
@@ -484,6 +581,7 @@
   width: 18px;
   height: 18px;
   object-fit: contain;
+  transform-origin: 50% 50%;
 }
 
 .zm-menu__check {
@@ -757,9 +855,20 @@ body.is-tablet .zoommap-settings .zm-icon-btn svg {
 
 .zoommap-collection-pin-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 6px;
+}
+
+@media (max-width: 980px) {
+  .zoommap-collection-pin-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 640px) {
+  .zoommap-collection-pin-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .zoommap-collection-pin-cell {

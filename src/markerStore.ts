@@ -135,6 +135,9 @@ export interface Marker {
   // Swap pins (icon sequence defined via collections)
   swapKey?: string;    // id of a SwapPinPreset in collections
   swapIndex?: number;  // current frame index in that preset
+  
+  // Per-marker override links for swap pins (frameIndex -> link)
+  swapLinks?: Record<number, string>;
 
   // Optional: per-pin zoom range (undefined → always visible)
   minZoom?: number;
@@ -183,6 +186,7 @@ export interface MeasurementConfig {
   metersPerPixel?: number;
   scales?: Record<string, number>;
   customUnitId?: string;
+  customUnitPxPerUnit?: Record<string, Record<string, number>>;
   travelTimePresetIds?: string[];
   travelDaysEnabled?: boolean;
 }
@@ -261,6 +265,7 @@ export class MarkerStore {
         metersPerPixel: undefined,
         scales: {},
         customUnitId: undefined,
+		customUnitPxPerUnit: {},
         travelTimePresetIds: [],
         travelDaysEnabled: false,
       },
@@ -326,6 +331,7 @@ export class MarkerStore {
   };
   parsed.measurement.scales ??= {};
   parsed.measurement.displayUnit ??= "auto-metric";
+  parsed.measurement.customUnitPxPerUnit ??= {};
   if (!Array.isArray(parsed.measurement.travelTimePresetIds)) {
   parsed.measurement.travelTimePresetIds = [];
 }

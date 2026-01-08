@@ -28,6 +28,8 @@ import { ViewEditorModal, type ViewEditorConfig } from "./viewEditorModal";
 import { SwapFramesEditorModal } from "./collectionsModals";
 import { TextLayerStyleModal } from "./textLayerStyleModal";
 import { SvgRasterExportModal } from "./svgRasterExportModal";
+import { SwapLinksEditorModal, type SwapLinksEditorResult } from "./swapLinksEditorModal";
+import type { ScaleUnitValue } from "./scaleCalibrateModal";
 
 /* ===== Collections (base-bound) ===== */
 export interface MarkerPreset {
@@ -152,6 +154,15 @@ export interface TravelPerDayConfig {
   unit: string;
 }
 
+export interface TravelRulesPack {
+  id: string;
+  name: string;
+  enabled?: boolean;
+  customUnits: CustomUnitDef[];
+  travelTimePresets: TravelTimePreset[];
+  travelPerDay: TravelPerDayConfig;
+}
+
 export interface ZoomMapSettings {
   icons: IconProfile[];
   defaultIconKey: string;
@@ -178,6 +189,7 @@ export interface ZoomMapSettings {
   enableTextLayers?: boolean;
   travelTimePresets?: TravelTimePreset[];
   travelPerDay?: TravelPerDayConfig;
+  travelRulesPacks?: TravelRulesPack[];
   svgRasterMaxScale?: 2 | 4 | 8;
   
   // Session image cache
@@ -185,6 +197,7 @@ export interface ZoomMapSettings {
   sessionImageCacheMb?: number;
   keepOverlaysLoaded?: boolean;
   preferCanvasImagesWhenCaching?: boolean;
+  showImageIconPreviewInSettings?: boolean;
 }
 
 interface Point { x: number; y: number; }
@@ -717,6 +730,14 @@ export class MapInstance extends Component {
   const modal = new ViewEditorModal(this.app, cfg, (res) => {
     if (res.action !== "save" || !res.config) return;
     void this.applyViewEditorResult(res.config);
+  }, {
+    onPreview: (previewCfg) => {
+      // Apply only frame preview live (no YAML write)
+      this.previewViewportFrameFromViewEditor({
+        viewportFrame: previewCfg.viewportFrame,
+        viewportFrameInsets: previewCfg.viewportFrameInsets,
+      });
+    },
   });
   modal.open();
   }
@@ -1062,6 +1083,57 @@ export class MapInstance extends Component {
     try { await img.decode(); } catch { /* ignore */ }
     this.frameNaturalW = img.naturalWidth || 0;
     this.frameNaturalH = img.naturalHeight || 0;
+  }
+  
+  public previewViewportFrameFromViewEditor(cfg: { viewportFrame?: string; viewportFrameInsets?: ZoomMapConfig["viewportFrameInsets"] }): void {
+    void this.previewViewportFrameFromViewEditorAsync(cfg);
+  }
+
+  private async previewViewportFrameFromViewEditorAsync(cfg: { viewportFrame?: string; viewportFrameInsets?: ZoomMapConfig["viewportFrameInsets"] }): Promise<void> {
+    const nextFrame = (cfg.viewportFrame ?? "").trim();
+    this.cfg.viewportFrame = nextFrame.length ? nextFrame : undefined;
+    this.cfg.viewportFrameInsets = cfg.viewportFrameInsets;
+
+    const wantFrame = typeof this.cfg.viewportFrame === "string" && this.cfg.viewportFrame.trim().length > 0;
+    this.el.classList.toggle("zm-root--framepad", wantFrame);
+
+    if (!wantFrame) {
+      // Remove frame layer if present
+      this.viewportFrameEl?.remove();
+      this.viewportFrameEl = null;
+      this.frameLayerEl?.remove();
+      this.frameLayerEl = null;
+      this.frameNaturalW = 0;
+      this.frameNaturalH = 0;
+      this.applyViewportInset();
+      this.onResize();
+      return;
+    }
+
+    // Ensure frame elements exist
+    if (!this.frameLayerEl) {
+      this.frameLayerEl = this.el.createDiv({ cls: "zm-frame-layer" });
+    }
+    if (!this.viewportFrameEl) {
+      const img = this.frameLayerEl.createEl("img", { cls: "zm-viewport-frame" });
+      img.decoding = "async";
+      img.draggable = false;
+      this.viewportFrameEl = img;
+    }
+
+    // Update src
+    const src = this.resolveResourceUrl(this.cfg.viewportFrame!.trim());
+    if (this.viewportFrameEl.src !== src) {
+      this.viewportFrameEl.src = src;
+    }
+
+    // If insets are framePx: need natural size
+    if (this.cfg.viewportFrameInsets?.unit === "framePx") {
+      await this.loadViewportFrameNaturalSize();
+    }
+
+    this.applyViewportInset();
+    this.onResize();
   }
   
   constructor(app: App, plugin: ZoomMapPlugin, el: HTMLElement, cfg: ZoomMapConfig) {
@@ -2986,15 +3058,52 @@ export class MapInstance extends Component {
     this.data.measurement.scales ??= {};
     this.data.measurement.displayUnit ??= "auto-metric";
     this.data.measurement.travelTimePresetIds ??= [];
+	this.data.measurement.customUnitPxPerUnit ??= {};
+  }
+  
+  private getCustomPxPerUnit(customUnitId: string): number | undefined {
+    const base = this.getActiveBasePath();
+    const map = this.data?.measurement?.customUnitPxPerUnit?.[base];
+    const v = map?.[customUnitId];
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+  }
+
+  private async applyCustomUnitCalibration(customUnitId: string, pxPerUnit: number): Promise<void> {
+    if (!this.data) return;
+    this.ensureMeasurement();
+    const base = this.getActiveBasePath();
+    const meas = this.data.measurement;
+    if (!meas) return;
+
+    meas.customUnitPxPerUnit ??= {};
+    meas.customUnitPxPerUnit[base] ??= {};
+    meas.customUnitPxPerUnit[base][customUnitId] = pxPerUnit;
+ 
+
+    // Switch display unit to the calibrated one
+    meas.displayUnit = "custom";
+    meas.customUnitId = customUnitId;
+
+    if (await this.store.wouldChange(this.data)) {
+      this.ignoreNextModify = true;
+      await this.store.save(this.data);
+    }
   }
 
   private updateMeasureHud(): void {
     if (!this.measureHud) return;
 
+    const px = this.computeDistancePixels();
     const meters = this.computeDistanceMeters();
+    const unit = this.data?.measurement?.displayUnit ?? "auto-metric";
 
     if (this.measuring || this.measurePts.length >= 2) {
-      const distTxt = meters != null ? this.formatDistance(meters) : "No scale";
+      let distTxt = "No scale";
+      if (unit === "custom") {
+        distTxt = px != null ? this.formatCustomDistanceFromPixels(px) : "No distance";
+      } else {
+        distTxt = meters != null ? this.formatDistance(meters) : "No scale";
+      }
 
       const lines: string[] = [`Distance: ${distTxt}`];
 
@@ -3017,6 +3126,28 @@ export class MapInstance extends Component {
 
     const pts: Point[] = [...this.measurePts];
     if (this.measuring && this.measurePreview) pts.push(this.measurePreview);
+	
+    let px = 0;
+    for (let i = 1; i < pts.length; i += 1) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      const dx = (b.x - a.x) * this.imgW;
+      const dy = (b.y - a.y) * this.imgH;
+      px += Math.hypot(dx, dy);
+    }
+
+    const mpp = this.getMetersPerPixel();
+    if (!mpp) return null;
+    return px * mpp;
+  }
+
+  private computeDistancePixels(): number | null {
+    if (!this.data) return null;
+    if (this.measurePts.length < 2 && !(this.measuring && this.measurePts.length >= 1 && this.measurePreview)) return null;
+
+    const pts: Point[] = [...this.measurePts];
+    if (this.measuring && this.measurePreview) pts.push(this.measurePreview);
+
 
     let px = 0;
     for (let i = 1; i < pts.length; i += 1) {
@@ -3026,9 +3157,29 @@ export class MapInstance extends Component {
       const dy = (b.y - a.y) * this.imgH;
       px += Math.hypot(dx, dy);
     }
-    const mpp = this.getMetersPerPixel();
-    if (!mpp) return null;
-    return px * mpp;
+	return px;
+  }
+  
+  private formatCustomDistanceFromPixels(px: number): string {
+    const meas = this.data?.measurement;
+    const defs = this.plugin.getActiveCustomUnits();
+    if (!meas || defs.length === 0) return "No custom units";
+
+    const id = meas.customUnitId ?? defs[0].id;
+    const def = defs.find((d) => d.id === id) ?? defs[0];
+    if (!def) return "No custom units";
+
+    const pxPerUnit = this.getCustomPxPerUnit(def.id);
+    const label =
+      (def.abbreviation ?? "").trim() ||
+      (def.name ?? "").trim() ||
+      "u";
+
+    if (!pxPerUnit) return `No calibration (${label})`;
+
+    const val = px / pxPerUnit;
+    const round = (v: number, d = 2) => Math.round(v * 10 ** d) / 10 ** d;
+    return `${round(val, 2)} ${label}`;
   }
 
  private formatDistance(m: number): string {
@@ -3038,7 +3189,7 @@ export class MapInstance extends Component {
       Math.round(v * 10 ** d) / 10 ** d;
 
     if (unit === "custom") {
-      const defs = this.plugin.settings.customUnits ?? [];
+      const defs = this.plugin.getActiveCustomUnits();
       if (defs.length === 0) {
         return `${round(m, 2)} u`;
       }
@@ -3094,12 +3245,15 @@ export class MapInstance extends Component {
     case "mi": return value * 1609.344;
     case "ft": return value * 0.3048;
     case "custom": {
-      const defs = this.plugin.settings.customUnits ?? [];
-      const def =
-        (customUnitId ? defs.find((d) => d.id === customUnitId) : undefined) ??
-        defs[0];
-      if (!def || !Number.isFinite(def.metersPerUnit) || def.metersPerUnit <= 0) return null;
-      return value * def.metersPerUnit;
+        const defs = this.plugin.getActiveCustomUnits();
+        const id =
+          (customUnitId ? defs.find((d) => d.id === customUnitId)?.id : undefined) ??
+          defs[0]?.id;
+        if (!id) return null;
+        const pxPerUnit = this.getCustomPxPerUnit(id);
+        const mpp = this.getMetersPerPixel();
+        if (!pxPerUnit || !mpp) return null;
+        return value * (pxPerUnit * mpp);
     }
     case "m":
     default:
@@ -3118,18 +3272,20 @@ export class MapInstance extends Component {
     const selected = new Set(this.data?.measurement?.travelTimePresetIds ?? []);
     if (selected.size === 0) return [];
 
-    const presets = this.plugin.settings.travelTimePresets ?? [];
+    const presets = this.plugin.getActiveTravelTimePresets();
     const out: string[] = [];
 	
-    const getTravelPerDay = (): { value: number | null; unit: string } => {
-      const cfg = this.plugin.settings.travelPerDay;
-      if (!cfg) return { value: null, unit: "" };
+    const perDayInfo = this.plugin.getActiveTravelPerDay();
+    const getTravelPerDay = (): { value: number | null; unit: string; note?: string } => {
+      if (!perDayInfo) return { value: null, unit: "" };
 
-      const value =
-        Number.isFinite(cfg.value) && cfg.value > 0 ? cfg.value : null;
-      const unit = (cfg.unit ?? "").trim();
+      const value = Number.isFinite(perDayInfo.value) && perDayInfo.value > 0 ? perDayInfo.value : null;
+      const unit = (perDayInfo.unit ?? "").trim();
+      const note = perDayInfo.multipleEnabled
+        ? `Multiple travel packs enabled; using "${perDayInfo.packName ?? "first enabled"}".`
+        : undefined;
 
-      return { value, unit };
+      return { value, unit, note };
     };
 
     const perDay = getTravelPerDay();
@@ -3156,7 +3312,11 @@ export class MapInstance extends Component {
 
       const t = (distanceMeters / refMeters) * p.timeValue;
       out.push(`Time (${name}): ${this.formatTravelTimeNumber(t)} ${unit}`);
+
       if (showDays) {
+        if (perDay.note) {
+          out.push(`Travel days: ${perDay.note}`);
+        }
         if (!perDayValue || !perDayUnit) {
           out.push("Travel days: not configured (set per-day unit/value in settings)");
           continue;
@@ -3174,18 +3334,13 @@ export class MapInstance extends Component {
         const fullDays = Math.floor(total / perDayValue);
         const rest = total - fullDays * perDayValue;
 
-        // pretty formatting
         const restAbs = Math.abs(rest);
         if (restAbs < 1e-6) {
           out.push(`Travel days (${perDayValue} ${perDayUnit}/day): ${fullDays}d`);
         } else if (fullDays <= 0) {
-          out.push(
-            `Travel days (${perDayValue} ${perDayUnit}/day): 0d + ${this.formatTravelTimeNumber(rest)} ${unit}`,
-          );
+          out.push(`Travel days (${perDayValue} ${perDayUnit}/day): 0d + ${this.formatTravelTimeNumber(rest)} ${unit}`);
         } else {
-          out.push(
-            `Travel days (${perDayValue} ${perDayUnit}/day): ${fullDays}d + ${this.formatTravelTimeNumber(rest)} ${unit}`,
-          );
+          out.push(`Travel days (${perDayValue} ${perDayUnit}/day): ${fullDays}d + ${this.formatTravelTimeNumber(rest)} ${unit}`);
         }
       }
     }
@@ -3635,23 +3790,11 @@ this.viewDragDist = 0;
         );
 
         const meas = this.data?.measurement;
-        let initialUnit: "m" | "km" | "mi" | "ft" | "custom" | undefined;
-        let customLabel: string | undefined;
-        let customAbbr: string | undefined;
-        let customMetersPerUnit: number | undefined;
+		const customDefs = this.plugin.getActiveCustomUnits();
 
-        if (meas?.displayUnit === "custom") {
-          const defs = this.plugin.settings.customUnits ?? [];
-          const def =
-            (meas.customUnitId &&
-              defs.find((d) => d.id === meas.customUnitId)) ??
-            defs[0];
-          if (def) {
-            initialUnit = "custom";
-            customLabel = def.name;
-            customAbbr = def.abbreviation;
-            customMetersPerUnit = def.metersPerUnit;
-          }
+        let initialUnit: ScaleUnitValue = "km";
+        if (meas?.displayUnit === "custom" && typeof meas.customUnitId === "string" && meas.customUnitId.trim()) {
+          initialUnit = `custom:${meas.customUnitId}` as ScaleUnitValue;
         } else if (
           meas?.displayUnit === "m" ||
           meas?.displayUnit === "km" ||
@@ -3659,30 +3802,43 @@ this.viewDragDist = 0;
           meas?.displayUnit === "ft"
         ) {
           initialUnit = meas.displayUnit;
-        } else {
-          initialUnit = "km";
         }
 
         new ScaleCalibrateModal(
           this.app,
           pxDist,
           (result) => {
-            void this.applyScaleCalibration(result.metersPerPixel);
-            new Notice(
-              `Scale set: ${result.metersPerPixel.toFixed(6)} m/px`,
-              2000,
-            );
+            void (async () => {
+              if (typeof result.metersPerPixel === "number") {
+                await this.applyScaleCalibration(result.metersPerPixel);
+                this.ensureMeasurement();
+                if (this.data?.measurement) {
+                  if (result.unit === "m" || result.unit === "km" || result.unit === "mi" || result.unit === "ft") {
+                    this.data.measurement.displayUnit = result.unit;
+                    delete this.data.measurement.customUnitId;
+                    await this.saveDataSoon();
+                  }
+                }
+                new Notice(`Scale set: ${result.metersPerPixel.toFixed(6)} m/px`, 2000);
+              } else if (result.customUnitId && typeof result.pixelsPerUnit === "number") {
+                await this.applyCustomUnitCalibration(result.customUnitId, result.pixelsPerUnit);
+                const defs = this.plugin.getActiveCustomUnits();
+                const def = defs.find((d) => d.id === result.customUnitId);
+                const label = (def?.abbreviation ?? def?.name ?? result.customUnitId).trim();
+                new Notice(`Unit scale set: ${result.pixelsPerUnit.toFixed(3)} px/${label}`, 2500);
+              }
+
+              this.updateMeasureHud();
+            })();
+
             this.calibrating = false;
             this.calibPts = [];
             this.calibPreview = null;
             this.renderCalibrate();
-            this.updateMeasureHud();
           },
           {
             initialUnit,
-            customLabel,
-            customAbbreviation: customAbbr,
-            customMetersPerUnit,
+            customUnits: customDefs.map((u) => ({ id: u.id, name: u.name, abbreviation: u.abbreviation })),
           },
         ).open();
       }
@@ -3884,6 +4040,33 @@ this.viewDragDist = 0;
     const idx = ((rawIndex % count) + count) % count;
     return preset.frames[idx];
   }
+  
+  private getSwapEffectiveLink(m: Marker): string | undefined {
+    if (m.type !== "swap") return m.link;
+    if (!m.swapKey) return m.link;
+
+    const preset = this.findSwapPresetById(m.swapKey);
+    if (!preset || !preset.frames.length) return m.link;
+
+    const rawIndex = typeof m.swapIndex === "number" ? m.swapIndex : 0;
+    const count = preset.frames.length;
+    const idx = ((rawIndex % count) + count) % count;
+
+    // 1) per-marker override
+    const override = m.swapLinks?.[idx];
+    if (typeof override === "string" && override.trim()) return override.trim();
+
+    // 2) preset frame link
+    const frame = preset.frames[idx];
+    const presetLink = (frame?.link ?? "").trim();
+    if (presetLink) return presetLink;
+
+    // 3) icon default link
+    const iconKey = (frame?.iconKey ?? "").trim();
+    if (iconKey) return this.plugin.getIconDefaultLink(iconKey);
+
+    return m.link;
+  }
 
   private advanceSwapPin(m: Marker): void {
     if (m.type !== "swap" || !m.swapKey) return;
@@ -4083,7 +4266,7 @@ private onContextMenuViewport(e: MouseEvent): void {
       },
     ];
 
-    const customDefs = this.plugin.settings.customUnits ?? [];
+    const customDefs = this.plugin.getActiveCustomUnits();
     if (customDefs.length > 0) {
       unitItems.push({ type: "separator" });
 
@@ -4126,6 +4309,7 @@ private onContextMenuViewport(e: MouseEvent): void {
       return {
         label: key || "(pin)",
         iconUrl: info.imgUrl,
+		iconRotationDeg: info.rotationDeg,
         action: () => {
           this.placePinAt(key, nx, ny);
           this.closeMenu();
@@ -4141,10 +4325,11 @@ private onContextMenuViewport(e: MouseEvent): void {
 
     const favItems = (arr: MarkerPreset[]): ZMMenuItem[] =>
       arr.map((p) => {
-        const ico = this.getIconInfo(p.iconKey);
+        const icon: { imgUrl: string; rotationDeg: number } = this.getIconInfo(p.iconKey);
         return {
           label: p.name || "(favorite)",
-          iconUrl: ico.imgUrl,
+          iconUrl: icon.imgUrl,
+          iconRotationDeg: icon.rotationDeg,
           action: () => {
             this.placePresetAt(p, nx, ny);
             this.closeMenu();
@@ -4178,6 +4363,12 @@ private onContextMenuViewport(e: MouseEvent): void {
         },
       },
     ];
+	
+    if (favsBaseMenu.length) {
+      addHereChildren.push({ type: "separator" });
+      addHereChildren.push({ label: "Favorites (base)", children: favsBaseMenu });
+    }	
+	
     if (pinsBaseMenu.length) {
       addHereChildren.push({ type: "separator" });
       addHereChildren.push({ label: "Pins (base)", children: pinsBaseMenu });
@@ -4185,15 +4376,9 @@ private onContextMenuViewport(e: MouseEvent): void {
     if (pinsGlobalMenu.length) {
       addHereChildren.push({ label: "Pins (global)", children: pinsGlobalMenu });
     }
-    if (favsBaseMenu.length) {
-      addHereChildren.push({ type: "separator" });
-      addHereChildren.push({ label: "Favorites (base)", children: favsBaseMenu });
-    }
     if (favsGlobalMenu.length) {
-      addHereChildren.push({
-        label: "Favorites (global)",
-        children: favsGlobalMenu,
-      });
+      addHereChildren.push({ type: "separator" });
+      addHereChildren.push({ label: "Favorites (global)", children: favsGlobalMenu });
     }
     if (stickersBaseMenu.length) {
       addHereChildren.push({ type: "separator" });
@@ -4245,6 +4430,10 @@ private onContextMenuViewport(e: MouseEvent): void {
     const items: ZMMenuItem[] = [
       { label: "Add marker here", children: addHereChildren },
     ];
+	
+    if (favsBaseMenu.length) {
+      items.push({ label: "Favorites (base)", children: favsBaseMenu });
+    }
 
     const layerChildren: ZMMenuItem[] = this.data.layers.map((layer) => {
       const state = this.getLayerState(layer);
@@ -4479,7 +4668,7 @@ private onContextMenuViewport(e: MouseEvent): void {
 	  },
 	);
 	
-	const travelPresets = this.plugin.settings.travelTimePresets ?? [];
+	const travelPresets = this.plugin.getActiveTravelTimePresets();
 	const selectedTravel = new Set(this.data.measurement?.travelTimePresetIds ?? []);
 
 	const travelTimeItems: ZMMenuItem[] =
@@ -4506,7 +4695,7 @@ private onContextMenuViewport(e: MouseEvent): void {
             {
               label: "(No travel presets configured)",
               action: () => {
-                new Notice("Configure presets in settings → travel time.", 3000);
+                new Notice("Configure presets in settings → travel rules.", 3000);
               },
             },
           ];
@@ -4873,13 +5062,18 @@ if (this.plugin.settings.enableTextLayers && this.data) {
         (this.measuring && this.measurePreview ? 1 : 0);
 
       if (ptsCount >= 2) {
-        const mpp = this.getMetersPerPixel();
+        const unit = this.data?.measurement?.displayUnit ?? "auto-metric";
+        const px = this.computeDistancePixels();
         const meters = this.computeDistanceMeters();
 
-        const distLabel =
-          !mpp || meters == null
-            ? "Distance: (no scale)"
-            : `Distance: ${this.formatDistance(meters)}`;
+        const distLabel = (() => {
+          if (unit === "custom") {
+            if (px == null) return "Distance: (no distance)";
+            return `Distance: ${this.formatCustomDistanceFromPixels(px)}`;
+          }
+          if (meters == null) return "Distance: (no scale)";
+          return `Distance: ${this.formatDistance(meters)}`;
+        })();
 
         items.push({ type: "separator" }, { label: distLabel });
       }
@@ -6600,7 +6794,34 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
           const items: ZMMenuItem[] = [
             {
-              label: "Edit swap pin",
+              label: "Edit swap pin links… ",
+              action: () => {
+                this.closeMenu();
+                if (!this.data) return;
+
+                new SwapLinksEditorModal(
+                  this.app,
+                  this.plugin,
+                  m,
+                  preset,
+                  (res: SwapLinksEditorResult) => {
+                    if (res.action !== "save") return;
+                    if (!this.data) return;
+
+                    if (res.swapLinks && Object.keys(res.swapLinks).length > 0) {
+                      m.swapLinks = res.swapLinks;
+                    } else {
+                      delete m.swapLinks;
+                    }
+
+                    void this.saveDataSoon();
+                    this.renderMarkersOnly();
+                  },
+                ).open();
+              },
+            },
+            {
+              label: "Edit swap preset…",
               action: () => {
                 this.closeMenu();
                 new SwapFramesEditorModal(
@@ -6744,8 +6965,7 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     let hoverOverride = false;
 
     if (m.type === "swap") {
-      const frame = this.getSwapFrameForMarker(m);
-      link = frame?.link;
+	  link = this.getSwapEffectiveLink(m);
 
       if (m.swapKey) {
         const preset = this.findSwapPresetById(m.swapKey);
@@ -7013,13 +7233,7 @@ if (this.plugin.settings.enableTextLayers && this.data) {
   }
   
   private openMarkerLink(m: Marker): void {
-    let link = m.link;
-
-    if (m.type === "swap") {
-      const frame = this.getSwapFrameForMarker(m);
-      link = frame?.link;
-    }
-
+    const link = this.getSwapEffectiveLink(m)?.trim();
     if (!link) return;
     void this.app.workspace.openLinkText(link, this.cfg.sourcePath);
   }
@@ -7968,6 +8182,7 @@ interface ZMMenuItem {
   // Menu item handler; receives the clicked row and the menu instance.
   action?: (rowEl: HTMLDivElement, menu?: ZMMenu) => void | Promise<void>;
   iconUrl?: string;
+  iconRotationDeg?: number;
   checked?: boolean;
   mark?: "check" | "x" | "minus";
   markColor?: string;
@@ -8017,6 +8232,14 @@ class ZMMenu {
       if (it.iconUrl) {
         const imgLeft = label.createEl("img", { cls: "zm-menu__icon" });
         imgLeft.src = it.iconUrl;
+
+        const deg =
+          typeof it.iconRotationDeg === "number" && Number.isFinite(it.iconRotationDeg)
+            ? it.iconRotationDeg
+            : 0;
+        if (deg) imgLeft.style.transform = `rotate(${deg}deg)`;
+        else imgLeft.style.removeProperty("transform");
+
         label.appendChild(document.createTextNode(" "));
       }
       label.appendText(it.label);

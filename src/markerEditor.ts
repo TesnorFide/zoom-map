@@ -3,6 +3,9 @@ import type { App, TextComponent } from "obsidian";
 import type { Marker, MarkerFileData } from "./markerStore";
 import type ZoomMapPlugin from "./main";
 
+type SwapPinFrameLite = { iconKey: string; link?: string };
+type SwapPinPresetLite = { id: string; name: string; frames: SwapPinFrameLite[] };
+
 interface LinkSuggestion {
   label: string;
   value: string;
@@ -44,6 +47,41 @@ export class MarkerEditorModal extends Modal {
   private allSuggestions: LinkSuggestion[] = [];
   private filteredSuggestions: LinkSuggestion[] = [];
   private selectedSuggestionIndex = -1;
+  
+  private findSwapPresetById(id: string): SwapPinPresetLite | null {
+    const cols =
+      (this.plugin.settings as unknown as {
+        baseCollections?: { include?: { swapPins?: SwapPinPresetLite[] } }[];
+      }).baseCollections ?? [];
+
+    for (const col of cols) {
+      const list = col?.include?.swapPins ?? [];
+      const found = list.find((sp) => sp?.id === id);
+      if (found && Array.isArray(found.frames)) return found;
+    }
+    return null;
+  }
+
+  private normalizeSwapFrameIndex(m: Marker, preset: SwapPinPresetLite): number {
+    const rawIndex = typeof m.swapIndex === "number" ? m.swapIndex : 0;
+    const count = preset.frames.length || 1;
+    return ((rawIndex % count) + count) % count;
+  }
+
+  private cleanupSwapLinks(): void {
+    if (this.marker.type !== "swap") return;
+    const links = this.marker.swapLinks;
+    if (!links || typeof links !== "object") {
+      delete this.marker.swapLinks;
+      return;
+    }
+    // Remove empty strings
+    for (const k of Object.keys(links)) {
+      const v = links[Number(k)];
+      if (typeof v !== "string" || !v.trim()) delete links[Number(k)];
+    }
+    if (Object.keys(links).length === 0) delete this.marker.swapLinks;
+  }
 
   constructor(
     app: App,
@@ -238,54 +276,105 @@ export class MarkerEditorModal extends Modal {
     });
 
     if (this.marker.type !== "sticker") {
-      const linkSetting = new Setting(contentEl)
-        .setName("Link")
-        .setDesc("Wiki link (without [[ ]]). Supports note and note#heading.");
+      if (this.marker.type === "swap") {
+        contentEl.createEl("h3", { text: "Swap pin (this marker only)" });
 
-      linkSetting.addText((t) => {
-        this.linkInput = t;
+        const preset = this.marker.swapKey ? this.findSwapPresetById(this.marker.swapKey) : null;
+        if (!preset) {
+          contentEl.createEl("div", { text: "Swap preset not found. Cannot edit per-frame links." });
+        } else {
+          const idx = this.normalizeSwapFrameIndex(this.marker, preset);
+          contentEl.createEl("div", { text: `Preset: ${preset.name} • Current frame: ${idx + 1}/${preset.frames.length}` });
 
-        t.setPlaceholder("Folder/note or note#heading")
-          .setValue(this.marker.link ?? "")
-          .onChange((v) => {
-            this.marker.link = v.trim();
-            this.updateLinkSuggestions(v);
+          const overrides = (this.marker.swapLinks ??= {});
+
+          preset.frames.forEach((fr, i) => {
+            const presetLink = (fr.link ?? "").trim();
+            const iconDefault = this.plugin.getIconDefaultLink(fr.iconKey) ?? "";
+            const fallback = presetLink || iconDefault;
+            const desc = fallback ? `Default: ${fallback}` : "Default: (none)";
+
+            new Setting(contentEl)
+              .setName(`Frame ${i + 1}: ${fr.iconKey}`)
+              .setDesc(desc)
+              .addText((t) => {
+                t.setPlaceholder("Override link (optional)");
+                t.setValue(overrides[i] ?? "");
+                t.onChange((v) => {
+                  const s = v.trim();
+                  if (s) overrides[i] = s;
+                  else delete overrides[i];
+
+                  if (Object.keys(overrides).length === 0) {
+                    delete this.marker.swapLinks;
+                  } else {
+                    this.marker.swapLinks = overrides;
+                  }
+                });
+              });
           });
 
-        const wrapper = t.inputEl.parentElement;
-        if (wrapper instanceof HTMLElement) {
-          wrapper.classList.add("zoommap-link-input-wrapper");
-          this.suggestionsEl = wrapper.createDiv({
-            cls: "zoommap-link-suggestions is-hidden",
-          });
+          new Setting(contentEl)
+            .setName("Clear all overrides")
+            .setDesc("Removes per-frame overrides from this marker (falls back to preset/icon defaults).")
+            .addButton((b) => {
+              b.setButtonText("Clear").onClick(() => {
+                delete this.marker.swapLinks;
+                this.close();
+                this.onResult({ action: "save", marker: this.marker, dataChanged: false });
+              });
+            });
         }
+      } else {
+        const linkSetting = new Setting(contentEl)
+          .setName("Link")
+          .setDesc("Wiki link (without [[ ]]). Supports note and note#heading.");
 
-        this.buildLinkSuggestions();
+        linkSetting.addText((t) => {
+          this.linkInput = t;
 
-        t.inputEl.addEventListener("keydown", (ev) => {
-          if (!this.suggestionsEl) return;
-          if (this.suggestionsEl.classList.contains("is-hidden")) return;
+          t.setPlaceholder("Folder/note or note#heading")
+            .setValue(this.marker.link ?? "")
+            .onChange((v) => {
+              this.marker.link = v.trim();
+              this.updateLinkSuggestions(v);
+            });
 
-          if (ev.key === "ArrowDown") {
-            ev.preventDefault();
-            this.moveLinkSuggestionSelection(1);
-          } else if (ev.key === "ArrowUp") {
-            ev.preventDefault();
-            this.moveLinkSuggestionSelection(-1);
-          } else if (ev.key === "Enter") {
-            if (this.selectedSuggestionIndex >= 0) {
-              ev.preventDefault();
-              this.applyLinkSuggestion(this.selectedSuggestionIndex);
-            }
-          } else if (ev.key === "Escape") {
-            this.hideLinkSuggestions();
+          const wrapper = t.inputEl.parentElement;
+          if (wrapper instanceof HTMLElement) {
+            wrapper.classList.add("zoommap-link-input-wrapper");
+            this.suggestionsEl = wrapper.createDiv({
+              cls: "zoommap-link-suggestions is-hidden",
+            });
           }
-        });
 
-        t.inputEl.addEventListener("blur", () => {
-          window.setTimeout(() => this.hideLinkSuggestions(), 150);
+          this.buildLinkSuggestions();
+
+          t.inputEl.addEventListener("keydown", (ev) => {
+            if (!this.suggestionsEl) return;
+            if (this.suggestionsEl.classList.contains("is-hidden")) return;
+
+            if (ev.key === "ArrowDown") {
+              ev.preventDefault();
+              this.moveLinkSuggestionSelection(1);
+            } else if (ev.key === "ArrowUp") {
+              ev.preventDefault();
+              this.moveLinkSuggestionSelection(-1);
+            } else if (ev.key === "Enter") {
+              if (this.selectedSuggestionIndex >= 0) {
+                ev.preventDefault();
+                this.applyLinkSuggestion(this.selectedSuggestionIndex);
+              }
+            } else if (ev.key === "Escape") {
+              this.hideLinkSuggestions();
+            }
+          });
+
+          t.inputEl.addEventListener("blur", () => {
+            window.setTimeout(() => this.hideLinkSuggestions(), 150);
+          });
         });
-      });
+      }
 	  
 	  new Setting(contentEl)
        .setName("Tooltip always on")
@@ -343,19 +432,26 @@ export class MarkerEditorModal extends Modal {
           });
         });
 
-      new Setting(contentEl)
-        .setName("Icon")
-        .setDesc("To set up new icons go to settings.")
-        .addDropdown((d) => {
-          for (const icon of this.plugin.settings.icons) {
-            d.addOption(icon.key, icon.key);
-          }
-          d.setValue(this.marker.iconKey ?? this.plugin.settings.defaultIconKey);
-          d.onChange((v) => {
-            this.marker.iconKey = v;
-            updatePreview();
+      if (this.marker.type !== "swap") {
+        new Setting(contentEl)
+          .setName("Icon")
+          .setDesc("To set up new icons go to settings.")
+          .addDropdown((d) => {
+            const sortedIcons = [...(this.plugin.settings.icons ?? [])].sort((a, b) =>
+              String(a.key ?? "").localeCompare(String(b.key ?? ""), undefined, {
+                sensitivity: "base",
+                numeric: true,
+              }),
+            );
+
+            for (const icon of sortedIcons) d.addOption(icon.key, icon.key);
+            d.setValue(this.marker.iconKey ?? this.plugin.settings.defaultIconKey);
+            d.onChange((v) => {
+              this.marker.iconKey = v;
+              updatePreview();
+            });
           });
-        });
+      }
 
       const colorRow = new Setting(contentEl)
         .setName("Icon color")
@@ -472,6 +568,44 @@ export class MarkerEditorModal extends Modal {
         const size = Math.max(1, Math.round(this.marker.stickerSize ?? 64));
         return { url, size };
       }
+	  
+      // Swap pins: preview the current frame icon
+      if (this.marker.type === "swap" && this.marker.swapKey) {
+        const preset = this.findSwapPresetById(this.marker.swapKey);
+        if (preset && preset.frames.length) {
+          const idx = this.normalizeSwapFrameIndex(this.marker, preset);
+          const frame = preset.frames[idx];
+          const key = frame?.iconKey || this.plugin.settings.defaultIconKey;
+          const baseIcon =
+            this.plugin.settings.icons.find((i) => i.key === key) ?? this.plugin.builtinIcon();
+
+          let url = baseIcon.pathOrDataUrl;
+          const size = baseIcon.size;
+
+          const color = this.marker.iconColor?.trim();
+          if (color && url && url.startsWith("data:image/svg+xml")) {
+            const comma = url.indexOf(",");
+            if (comma >= 0) {
+              try {
+                const header = url.slice(0, comma + 1);
+                const payload = url.slice(comma + 1);
+                const svg = decodeURIComponent(payload);
+                const tinted = tintSvgMarkup(svg, color);
+                url = header + encodeURIComponent(tinted);
+              } catch {
+                // ignore
+              }
+            }
+          }
+
+          if (url && !url.startsWith("data:")) {
+            const file = this.app.vault.getAbstractFileByPath(url);
+            if (file instanceof TFile) url = this.app.vault.getResourcePath(file);
+          }
+
+          return { url, size };
+        }
+      }
 
       const baseIcon =
         this.plugin.settings.icons.find(
@@ -549,6 +683,10 @@ export class MarkerEditorModal extends Modal {
 	    if (!this.marker.iconColor) delete this.marker.iconColor;
 	    if (!this.marker.tooltipAlwaysOn) delete this.marker.tooltipAlwaysOn;
 	  }
+	  
+      if (this.marker.type === "swap") {
+        this.cleanupSwapLinks();
+      }
 
       this.close();
       this.onResult({

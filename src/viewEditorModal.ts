@@ -40,15 +40,18 @@ export interface ViewEditorResult {
 }
 
 type ViewEditorCallback = (result: ViewEditorResult) => void;
+type ViewEditorPreviewCallback = (config: ViewEditorConfig) => void;
 
 export class ViewEditorModal extends Modal {
   private cfg: ViewEditorConfig;
   private onResult: ViewEditorCallback;
+  private onPreview?: ViewEditorPreviewCallback;
 
-  constructor(app: App, initial: ViewEditorConfig, onResult: ViewEditorCallback) {
+  constructor(app: App, initial: ViewEditorConfig, onResult: ViewEditorCallback, opts?: { onPreview?: ViewEditorPreviewCallback }) {
     super(app);
     this.cfg = JSON.parse(JSON.stringify(initial)) as ViewEditorConfig;
     this.onResult = onResult;
+	this.onPreview = opts?.onPreview;
 
     if (!this.cfg.imageBases || this.cfg.imageBases.length === 0) {
       this.cfg.imageBases = [{ path: "", name: "" }];
@@ -500,6 +503,17 @@ export class ViewEditorModal extends Modal {
       b.setButtonText("Clear").onClick(() => {
         this.cfg.viewportFrame = undefined;
         if (frameInputEl) frameInputEl.value = "";
+      }),
+    );
+	
+    frameSetting.addButton((b) =>
+      b.setButtonText("Update viewport").onClick(() => {
+        if (!this.onPreview) {
+          new Notice("No active map preview available.", 2000);
+          return;
+        }
+        this.onPreview(JSON.parse(JSON.stringify(this.cfg)) as ViewEditorConfig);
+        new Notice("Viewport updated (preview).", 1200);
       }),
     );
 

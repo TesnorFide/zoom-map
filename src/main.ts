@@ -19,6 +19,8 @@ import type {
   IconProfile,
   BaseCollection,
   CustomUnitDef,
+  TravelTimePreset,
+  TravelRulesPack,
 } from "./map";
 
 import { ViewEditorModal, type ViewEditorConfig } from "./viewEditorModal";
@@ -30,6 +32,7 @@ import { FaIconPickerModal } from "./faIconPickerModal";
 import { PreferencesModal } from "./preferencesModal";
 import { IconOutlineModal } from "./iconOutlineModal";
 import { ImageCache } from "./imageCache";
+import { TravelRulesManagerModal } from "./travelRulesModals";
 
 /* ---------------- Utils ---------------- */
 
@@ -129,6 +132,7 @@ const DEFAULT_SETTINGS: ZoomMapSettingsExtended = {
   customUnits: [],
   travelTimePresets: [],
   travelPerDay: { value: 8, unit: "h" },
+  travelRulesPacks: [],
   defaultScaleLikeSticker: false,
   enableDrawing: false,
   preferActiveLayerInEditor: false,
@@ -138,6 +142,7 @@ const DEFAULT_SETTINGS: ZoomMapSettingsExtended = {
   keepOverlaysLoaded: false,
   preferCanvasImagesWhenCaching: false, 
   svgRasterMaxScale: 8,
+  showImageIconPreviewInSettings: false,
 };
 
 /* ---------------- YAML parsing helpers ---------------- */
@@ -647,6 +652,47 @@ export default class ZoomMapPlugin extends Plugin {
     this.addSettingTab(new ZoomMapSettingTab(this.app, this));
   }
   
+  getIconDefaultLink(iconKey: string): string | undefined {
+    const key = (iconKey ?? "").trim();
+    if (!key) return undefined;
+    const icon = this.settings.icons?.find((i) => i.key === key);
+    const raw = icon?.defaultLink;
+    const trimmed = typeof raw === "string" ? raw.trim() : "";
+    return trimmed.length ? trimmed : undefined;
+  }
+
+  private getEnabledTravelPacks(): TravelRulesPack[] {
+    const packsRaw = this.settings.travelRulesPacks ?? [];
+    const packs = packsRaw.filter((p): p is TravelRulesPack => {
+      if (!p || typeof p !== "object") return false;
+      if (Array.isArray(p)) return false;
+      const r = p as Record<string, unknown>;
+      return typeof r.id === "string";
+    });
+    return packs.filter((p) => p.enabled === true);
+  }
+
+  getActiveCustomUnits(): CustomUnitDef[] {
+    const packs = this.getEnabledTravelPacks();
+    return packs.flatMap((p) => p.customUnits ?? []);
+  }
+
+  getActiveTravelTimePresets(): TravelTimePreset[] {
+    const packs = this.getEnabledTravelPacks();
+    return packs.flatMap((p) => p.travelTimePresets ?? []);
+  }
+
+  getActiveTravelPerDay(): { value: number; unit: string; packName?: string; multipleEnabled?: boolean } | null {
+    const packs = this.getEnabledTravelPacks();
+    if (packs.length === 0) return null;
+
+    const first = packs[0];
+    const cfg = first.travelPerDay ?? { value: 8, unit: "h" };
+    const value = Number.isFinite(cfg.value) && cfg.value > 0 ? cfg.value : 8;
+    const unit = (cfg.unit ?? "").trim() || "h";
+    return { value, unit, packName: first.name, multipleEnabled: packs.length > 1 };
+  }
+  
   onunload(): void {
     this.imageCache?.clear();
     this.imageCache = null;
@@ -681,6 +727,45 @@ export default class ZoomMapPlugin extends Plugin {
     this.settings.customUnits ??= [];
 	this.settings.travelTimePresets ??= [];
     this.settings.travelPerDay ??= { value: 8, unit: "h" };
+    this.settings.travelRulesPacks ??= [];
+	
+    // Normalize travel packs (back-compat + safety defaults)
+    if (Array.isArray(this.settings.travelRulesPacks)) {
+      for (const p of this.settings.travelRulesPacks) {
+        if (typeof p.enabled !== "boolean") {
+          p.enabled = true;
+        }
+
+        p.customUnits ??= [];
+        p.travelTimePresets ??= [];
+        p.travelPerDay ??= { value: 8, unit: "h" };
+
+        const perDay = p.travelPerDay;
+        if (!Number.isFinite(perDay.value) || perDay.value <= 0) perDay.value = 8;
+        perDay.unit = (perDay.unit ?? "").trim() || "h";
+      }
+    }
+
+    // Migration: move legacy customUnits/travelTimePresets/travelPerDay into a default pack
+    if ((this.settings.travelRulesPacks?.length ?? 0) === 0) {
+      const legacyUnits = this.settings.customUnits ?? [];
+      const legacyPresets = this.settings.travelTimePresets ?? [];
+      const legacyPerDay = this.settings.travelPerDay ?? { value: 8, unit: "h" };
+
+      // Only create the default pack if we have legacy content OR we want a default container.
+      const shouldCreate = legacyUnits.length > 0 || legacyPresets.length > 0 || !!legacyPerDay;
+      if (shouldCreate) {
+        const pack: TravelRulesPack = {
+          id: `trp-${Math.random().toString(36).slice(2, 8)}`,
+          name: "Default travel rules",
+          enabled: true,
+          customUnits: legacyUnits,
+          travelTimePresets: legacyPresets,
+          travelPerDay: legacyPerDay,
+        };
+        this.settings.travelRulesPacks = [pack];
+      }
+    }
     if (!Number.isFinite(this.settings.travelPerDay.value) || this.settings.travelPerDay.value <= 0) {
       this.settings.travelPerDay.value = 8;
     }
@@ -692,6 +777,7 @@ export default class ZoomMapPlugin extends Plugin {
     this.settings.keepOverlaysLoaded ??= false;
     this.settings.preferCanvasImagesWhenCaching ??= false;
 	this.settings.svgRasterMaxScale ??= 8;
+	this.settings.showImageIconPreviewInSettings ??= false;
   }
 
   async saveSettings(): Promise<void> {
@@ -999,7 +1085,7 @@ class ZoomMapSettingTab extends PluginSettingTab {
         key = `${baseKey}-${idx++}`;
       }
 
-      icons.push({
+      icons.unshift({
         key,
         pathOrDataUrl: dataUrl,
         size: 24,
@@ -1087,6 +1173,10 @@ class ZoomMapSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("zoommap-settings");
+    containerEl.classList.toggle(
+      "zoommap-settings--imgpreview",
+      !!this.plugin.settings.showImageIconPreviewInSettings,
+    );
 
     // Storage
     new Setting(containerEl).setName("Storage").setHeading();
@@ -1275,278 +1365,19 @@ class ZoomMapSettingTab extends PluginSettingTab {
           }),
       );
 
-    // Custom units
-    new Setting(containerEl).setName("Custom units").setHeading();
-
-    const customUnitsWrap = containerEl.createDiv();
-    const renderCustomUnits = () => {
-      customUnitsWrap.empty();
-
-      const ext = this.plugin.settings as ZoomMapSettingsExtended;
-      ext.customUnits ??= [];
-      const units = ext.customUnits;
-
-      if (units.length === 0) {
-        customUnitsWrap.createEl("div", { text: "No custom units defined yet." });
-      } else {
-        units.forEach((u, idx) => {
-          const row = customUnitsWrap.createDiv({ cls: "zoommap-custom-unit-row" });
-
-          const nameInput = row.createEl("input", { type: "text" });
-          nameInput.placeholder = "Name (e.g. Hex)";
-          nameInput.value = u.name;
-          nameInput.oninput = () => {
-            u.name = nameInput.value.trim();
-            void this.plugin.saveSettings();
-          };
-
-          const abbrInput = row.createEl("input", { type: "text" });
-          abbrInput.placeholder = "Abbreviation";
-          abbrInput.value = u.abbreviation;
-          abbrInput.oninput = () => {
-            u.abbreviation = abbrInput.value.trim();
-            void this.plugin.saveSettings();
-          };
-
-          const factorInput = row.createEl("input", { type: "number" });
-          factorInput.placeholder = "1.0";
-          factorInput.value = String(u.metersPerUnit);
-          factorInput.step = "0.0001";
-          factorInput.oninput = () => {
-            const n = Number(factorInput.value);
-            if (Number.isFinite(n) && n > 0) {
-              u.metersPerUnit = n;
-              void this.plugin.saveSettings();
-            }
-          };
-
-          const delBtn = row.createEl("button", { text: "Delete" });
-          delBtn.onclick = () => {
-            units.splice(idx, 1);
-            void this.plugin.saveSettings().then(() => {
-              renderCustomUnits();
-            });
-          };
-        });
-      }
-
-      const addBtn = customUnitsWrap.createEl("button", { text: "Add custom unit" });
-      addBtn.addClass("zoommap-custom-unit-add-button");
-      addBtn.onclick = () => {
-        const ext2 = this.plugin.settings as ZoomMapSettingsExtended;
-        ext2.customUnits ??= [];
-        const id = `cu-${Math.random().toString(36).slice(2, 8)}`;
-        ext2.customUnits.push({
-          id,
-          name: "Hex",
-          abbreviation: "hex",
-          metersPerUnit: 5 * 0.3048,
-        } as CustomUnitDef);
-
-        void this.plugin.saveSettings().then(() => {
-          renderCustomUnits();
-        });
-      };
-    };
-    renderCustomUnits();
-	
-	new Setting(containerEl).setName("Travel time (distance → time)").setHeading();
-	
-    // -------- Travel time per day (global config) --------
-    this.plugin.settings.travelPerDay ??= { value: 8, unit: "h" };
-    if (
-      !Number.isFinite(this.plugin.settings.travelPerDay.value) ||
-      this.plugin.settings.travelPerDay.value <= 0
-    ) {
-      this.plugin.settings.travelPerDay.value = 8;
-    }
-    this.plugin.settings.travelPerDay.unit =
-      (this.plugin.settings.travelPerDay.unit ?? "").trim() || "h";
-
-    const perDayWrap = containerEl.createDiv();
-
-    const collectTimeUnits = (): string[] => {
-      const presets = this.plugin.settings.travelTimePresets ?? [];
-      const set = new Set<string>();
-      for (const p of presets) {
-        const u = (p?.timeUnit ?? "").trim();
-        if (u) set.add(u);
-      }
-      return Array.from(set).sort((a, b) => a.localeCompare(b));
-    };
-	
-    const renderPerDay = () => {
-      perDayWrap.empty();
-
-      const cfg = this.plugin.settings.travelPerDay!;
-
-      const row = new Setting(perDayWrap)
-        .setName("Max travel time per day")
-        .setDesc("Must match the time unit of a travel preset to show travel days for that preset.");
-
-      row.addText((t) => {
-        t.inputEl.type = "number";
-        t.setPlaceholder("8");
-        t.setValue(String(cfg.value ?? 8));
-        t.onChange((v) => {
-          const n = Number(String(v).replace(",", "."));
-          if (!Number.isFinite(n) || n <= 0) return;
-          cfg.value = n;
-          void this.plugin.saveSettings();
-        });
-      });
-
-      row.addDropdown((d) => {
-        const units = collectTimeUnits();
-        if (units.length === 0) {
-          d.addOption(cfg.unit || "h", cfg.unit || "h");
-          d.setDisabled(true);
-          d.setValue(cfg.unit || "h");
-          return;
-        }
-
-        for (const u of units) d.addOption(u, u);
-
-        const current = (cfg.unit ?? "").trim();
-        const pick = units.includes(current) ? current : units[0];
-        cfg.unit = pick;
-        d.setValue(pick);
-
-        d.onChange((v) => {
-          cfg.unit = (v ?? "").trim();
-          void this.plugin.saveSettings();
-        });
-      });
-    };
-
-	let perDayRerenderTimer: number | null = null;
-	const scheduleRenderPerDay = () => {
-	  if (perDayRerenderTimer !== null) window.clearTimeout(perDayRerenderTimer);
-	  perDayRerenderTimer = window.setTimeout(() => {
-		perDayRerenderTimer = null;
-		renderPerDay();
-	  }, 250);
-	};
-
-	renderPerDay();
-
-	const travelWrap = containerEl.createDiv();
-
-	const renderTravel = () => {
-	  travelWrap.empty();
-
-	  const presets = (this.plugin.settings.travelTimePresets ??= []);
-	  const customDefs = this.plugin.settings.customUnits ?? [];
-
-	  const head = travelWrap.createDiv({ cls: "zm-travel-grid-head" });
-	  head.createSpan({ text: "Mode" });
-	  head.createSpan({ text: "Dist" });
-	  head.createSpan({ text: "Unit" });
-	  head.createSpan({ text: "Time" });
-	  head.createSpan({ text: "Time unit" });
-	  head.createSpan({ text: "" });
-
-	  const grid = travelWrap.createDiv({ cls: "zm-travel-grid" });
-
-	  const addUnitOptions = (sel: HTMLSelectElement) => {
-		const add = (value: string, label: string) => {
-		  const opt = document.createElement("option");
-		  opt.value = value;
-		  opt.textContent = label;
-		  sel.appendChild(opt);
-		};
-
-		add("m", "m");
-		add("km", "km");
-		add("mi", "mi");
-		add("ft", "ft");
-
-		for (const def of customDefs) {
-		  const label = def.abbreviation ? `${def.name} (${def.abbreviation})` : def.name;
-		  add(`custom:${def.id}`, label);
-		}
-	  };
-
-	  presets.forEach((p, idx) => {
-		const name = grid.createEl("input", { type: "text", cls: "zm-travel-name" });
-		name.value = p.name ?? "";
-		name.oninput = () => {
-		  p.name = name.value.trim();
-		  void this.plugin.saveSettings();
-		};
-
-		const distVal = grid.createEl("input", { type: "number", cls: "zm-travel-num" });
-		distVal.value = String(p.distanceValue ?? 1);
-		distVal.oninput = () => {
-		  const n = Number(distVal.value);
-		  if (Number.isFinite(n) && n > 0) p.distanceValue = n;
-		  void this.plugin.saveSettings();
-		};
-
-		const unitSel = grid.createEl("select", { cls: "zm-travel-unit" });
-		addUnitOptions(unitSel);
-
-		const current =
-		  p.distanceUnit === "custom" ? `custom:${p.distanceCustomUnitId ?? ""}` : p.distanceUnit;
-
-		unitSel.value =
-		  Array.from(unitSel.options).some((o) => o.value === current) ? current : "km";
-
-		unitSel.onchange = () => {
-		  const v = unitSel.value;
-		  if (v.startsWith("custom:")) {
-			p.distanceUnit = "custom";
-			p.distanceCustomUnitId = v.slice("custom:".length) || undefined;
-		  } else {
-			p.distanceUnit = v as "m" | "km" | "mi" | "ft";
-			p.distanceCustomUnitId = undefined;
-		  }
-		  void this.plugin.saveSettings();
-		};
-
-		const timeVal = grid.createEl("input", { type: "number", cls: "zm-travel-num" });
-		timeVal.value = String(p.timeValue ?? 1);
-		timeVal.oninput = () => {
-		  const n = Number(timeVal.value);
-		  if (Number.isFinite(n) && n > 0) p.timeValue = n;
-		  void this.plugin.saveSettings();
-		};
-
-		const timeUnit = grid.createEl("input", { type: "text", cls: "zm-travel-timeunit" });
-		timeUnit.value = p.timeUnit ?? "";
-		timeUnit.oninput = () => {
-		  p.timeUnit = timeUnit.value.trim();
-		  void this.plugin.saveSettings();
-          scheduleRenderPerDay();
-		};
-
-		const del = grid.createEl("button", { cls: "zm-icon-btn", attr: { title: "Delete" } });
-		setIcon(del, "trash");
-		del.onclick = () => {
-		  presets.splice(idx, 1);
-		  void this.plugin.saveSettings();
-		  renderTravel();
-		};
-	  });
-
-	  const addBtn = travelWrap.createEl("button", { text: "Add travel preset" });
-	  addBtn.onclick = () => {
-		presets.push({
-		  id: `tt-${Math.random().toString(36).slice(2, 8)}`,
-		  name: "Donkey",
-		  distanceValue: 1,
-		  distanceUnit: "mi",
-		  timeValue: 4,
-		  timeUnit: "h",
-		});
-		void this.plugin.saveSettings();
-		renderTravel();
-	  };
-	  renderPerDay();
-	};
-
-	renderTravel();
-	renderPerDay();
+    // Travel rules (custom units + travel presets)
+    new Setting(containerEl).setName("Travel rules").setHeading();
+    new Setting(containerEl)
+      .setName("Manage travel rules packs")
+      .setDesc("Custom units + distance→time presets are managed in packs (import/export supported).")
+      .addButton((b) =>
+        b.setButtonText("Open…").onClick(() => {
+          new TravelRulesManagerModal(this.app, this.plugin, () => {
+            // re-render settings summary if needed
+            this.display();
+          }).open();
+        }),
+      );
 
     /* ---------------- Collections ---------------- */
 
@@ -1693,6 +1524,29 @@ class ZoomMapSettingTab extends PluginSettingTab {
 
     // SVG icons section
     new Setting(containerEl).setName("SVG icons").setHeading();
+	
+    // ---- Add SVG icon (MOVE ABOVE LIST) ----
+    const addSvgSetting = new Setting(containerEl)
+      .setName("Add SVG icon")
+      .setDesc("Create a pin icon from an SVG file in the configured folder.");
+
+    const infoIcon = addSvgSetting.controlEl.createDiv({ cls: "zoommap-info-icon" });
+    setIcon(infoIcon, "info");
+    infoIcon.setAttr(
+      "title",
+      "Rendering many SVG files in the picker can cause noticeable delays while all previews are generated. Once the icons are cached, searching and adding should feel much faster.",
+    );
+
+    addSvgSetting.addButton((b) =>
+      b.setButtonText("Add SVG icon").onClick(() => {
+        const ext = this.plugin.settings as ZoomMapSettingsExtended;
+        const folder = ext.faFolderPath?.trim() || "ZoomMap/SVGs";
+
+        new FaIconPickerModal(this.app, folder, (file: TFile) => {
+          void this.addFontAwesomeIcon(file);
+        }).open();
+      }),
+    );
 
     const svgFolderRow = new Setting(containerEl)
       .setName("SVG icon folder in vault")
@@ -1857,33 +1711,33 @@ class ZoomMapSettingTab extends PluginSettingTab {
 
     const svgIconsGrid = containerEl.createDiv({ cls: "zm-icons-grid zm-grid" });
 
-    const addSvgSetting = new Setting(containerEl)
-      .setName("Add SVG icon")
-      .setDesc("Create a pin icon from an SVG file in the configured folder.");
-
-    const infoIcon = addSvgSetting.controlEl.createDiv({ cls: "zoommap-info-icon" });
-    setIcon(infoIcon, "info");
-    infoIcon.setAttr(
-      "title",
-      "Rendering many SVG files in the picker can cause noticeable delays while all previews are generated. Once the icons are cached, searching and adding should feel much faster.",
-    );
-
-    addSvgSetting.addButton((b) =>
-      b.setButtonText("Add SVG icon").onClick(() => {
-        const ext = this.plugin.settings as ZoomMapSettingsExtended;
-        const folder = ext.faFolderPath?.trim() || "ZoomMap/SVGs";
-
-        new FaIconPickerModal(this.app, folder, (file: TFile) => {
-          void this.addFontAwesomeIcon(file);
-        }).open();
-      }),
-    );
-
     // Image icons heading
     new Setting(containerEl).setName("Image icons").setHeading();
+	
+    // ---- Add new icon (MOVE ABOVE LIST) ----
+    new Setting(containerEl)
+      .setName("Add new icon")
+      .setDesc("Create a new image-based icon entry.")
+      .addButton((b) =>
+        b.setButtonText("Add").onClick(() => {
+          const idx = this.plugin.settings.icons.length + 1;
+          this.plugin.settings.icons.unshift({
+            key: `pin-${idx}`,
+            pathOrDataUrl: "",
+            size: 24,
+            anchorX: 12,
+            anchorY: 12,
+          });
+          void this.plugin.saveSettings();
+          renderIcons?.();
+        }),
+      );
 
-    const imgIconsHead = containerEl.createDiv({ cls: "zm-icons-grid-head zm-grid" });
+    const imgIconsHead = containerEl.createDiv({ cls: "zm-icons-grid-head zm-grid zm-icons-grid-head--img" });
     imgIconsHead.createSpan({ text: "Name" });
+    if (this.plugin.settings.showImageIconPreviewInSettings) {
+      imgIconsHead.createSpan();
+    }
     imgIconsHead.createSpan({ text: "Path / data:URL + default link" });
     imgIconsHead.createSpan({ text: "Size" });
 
@@ -1902,9 +1756,11 @@ class ZoomMapSettingTab extends PluginSettingTab {
     const headImgTrash = imgIconsHead.createSpan();
     setIcon(headImgTrash, "trash");
 
-    const imgIconsGrid = containerEl.createDiv({ cls: "zm-icons-grid zm-grid" });
+    const imgIconsGrid = containerEl.createDiv({ cls: "zm-icons-grid zm-grid zm-icons-grid--img" });
+	
+	let renderIcons: () => void;
 
-    const renderIcons = () => {
+    renderIcons = () => {
       svgIconsGrid.empty();
       imgIconsGrid.empty();
 
@@ -2097,6 +1953,33 @@ class ZoomMapSettingTab extends PluginSettingTab {
             icon.key = name.value.trim();
             void this.plugin.saveSettings();
           };
+		  
+          // Optional preview column (between name and path)
+          const showPreview = !!this.plugin.settings.showImageIconPreviewInSettings;
+          let previewImg: HTMLImageElement | null = null;
+          const refreshPreview = () => {
+            if (!previewImg) return;
+            let src = (icon.pathOrDataUrl ?? "").trim();
+            if (!src) {
+              previewImg.src = "";
+              return;
+            }
+            if (src.startsWith("data:")) {
+              previewImg.src = src;
+              return;
+            }
+            const f = this.app.vault.getAbstractFileByPath(src);
+            if (f instanceof TFile) {
+              previewImg.src = this.app.vault.getResourcePath(f);
+              return;
+            }
+            previewImg.src = src;
+          };
+
+          if (showPreview) {
+            previewImg = row.createEl("img", { cls: "zoommap-settings__icon-preview zoommap-settings__icon-preview--img" });
+            refreshPreview();
+          }
 
           const pathWrap = row.createDiv({ cls: "zm-path-wrap" });
 
@@ -2106,6 +1989,7 @@ class ZoomMapSettingTab extends PluginSettingTab {
           path.oninput = () => {
             icon.pathOrDataUrl = path.value.trim();
             void this.plugin.saveSettings();
+			refreshPreview();
           };
 
           const pick = pathWrap.createEl("button", { attr: { title: "Choose file…" } });
@@ -2115,6 +1999,8 @@ class ZoomMapSettingTab extends PluginSettingTab {
             new ImageFileSuggestModal(this.app, (file: TFile) => {
               icon.pathOrDataUrl = file.path;
               void this.plugin.saveSettings();
+              path.value = file.path;
+              refreshPreview();
               renderIcons();
             }).open();
           };
@@ -2195,23 +2081,5 @@ class ZoomMapSettingTab extends PluginSettingTab {
     };
 
     renderIcons();
-
-    new Setting(containerEl)
-      .setName("Add new icon")
-      .setDesc("Create a new image-based icon entry.")
-      .addButton((b) =>
-        b.setButtonText("Add").onClick(() => {
-          const idx = this.plugin.settings.icons.length + 1;
-          this.plugin.settings.icons.push({
-            key: `pin-${idx}`,
-            pathOrDataUrl: "",
-            size: 24,
-            anchorX: 12,
-            anchorY: 12,
-          });
-          void this.plugin.saveSettings();
-          this.display();
-        }),
-      );
   }
 }

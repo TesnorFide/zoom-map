@@ -96,6 +96,16 @@ export class PreferencesModal extends Modal {
       });
 
     new Setting(contentEl)
+      .setName("Settings UI: show preview for image icons")
+      .setDesc("Shows a small preview thumbnail for non-SVG image icons in the icon library list.")
+      .addToggle((toggle) => {
+        toggle.setValue(!!this.plugin.settings.showImageIconPreviewInSettings).onChange(async (value) => {
+          this.plugin.settings.showImageIconPreviewInSettings = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(contentEl)
       .setName("Enable text layers")
       .setDesc("Enables text boxes with baselines and inline typing on maps.")
       .addToggle((toggle) => {

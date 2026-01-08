@@ -62,6 +62,7 @@ export class CollectionEditorModal extends Modal {
 
   onOpen(): void {
     const { contentEl } = this;
+	this.modalEl.addClass("zoommap-modal--wide");
     contentEl.empty();
 
     contentEl.createEl("h2", { text: "Edit collection" });
