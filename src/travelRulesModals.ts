@@ -1,7 +1,7 @@
 import { Modal, Notice, Setting, TFile, normalizePath } from "obsidian";
 import type { App } from "obsidian";
 import type ZoomMapPlugin from "./main";
-import type { TravelRulesPack, CustomUnitDef, TerrainDef, TravelTimePreset, TravelPerDayConfig } from "./map";
+import type { TravelRulesPack, CustomUnitDef, TerrainDef, TravelTimePreset, TravelPerDayConfig, TravelPerDayPreset } from "./map";
 import { JsonFileSuggestModal } from "./jsonFileSuggest";
 
 type DoneCb = () => void;
@@ -26,6 +26,16 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 function isTravelPerDayConfig(x: unknown): x is TravelPerDayConfig {
   if (!isRecord(x)) return false;
   return typeof x.value === "number" && typeof x.unit === "string";
+}
+
+function isTravelPerDayPreset(x: unknown): x is TravelPerDayPreset {
+  if (!isRecord(x)) return false;
+  return (
+    typeof x.id === "string" &&
+    typeof x.name === "string" &&
+    typeof x.value === "number" &&
+    typeof x.unit === "string"
+  );
 }
 
 function isCustomUnitDef(x: unknown): x is CustomUnitDef {
@@ -58,7 +68,9 @@ function isTravelRulesPack(x: unknown): x is TravelRulesPack {
   if (!Array.isArray(x.customUnits) || !x.customUnits.every(isCustomUnitDef)) return false;
   if (!Array.isArray(x.terrains) || !x.terrains.every(isTerrainDef)) return false;
   if (!Array.isArray(x.travelTimePresets) || !x.travelTimePresets.every(isTravelTimePreset)) return false;
-  if (!isTravelPerDayConfig(x.travelPerDay)) return false;
+  const hasNew = Array.isArray(x.travelPerDayPresets) && x.travelPerDayPresets.every(isTravelPerDayPreset);
+  const hasOld = isTravelPerDayConfig(x.travelPerDay);
+  if (!hasNew && !hasOld) return false;
   if ("enabled" in x && typeof x.enabled !== "boolean") return false;
   return true;
 }
@@ -177,7 +189,8 @@ export class TravelRulesManagerModal extends Modal {
         customUnits: [],
 		terrains: [{ id: genId("ter"), name: "Normal", factor: 1 }],
         travelTimePresets: [],
-        travelPerDay: { value: 8, unit: "h" },
+        travelPerDayPresets: [{ id: genId("tpd"), name: "Default", value: 8, unit: "h" }],
+        travelPerDay: { value: 8, unit: "h" }, // legacy mirror
       });
       void this.plugin.saveSettings().then(() => this.render());
     };
@@ -280,7 +293,8 @@ class TravelRulesPackEditorModal extends Modal {
     this.working.customUnits ??= [];
 	this.working.terrains ??= [];
     this.working.travelTimePresets ??= [];
-    this.working.travelPerDay ??= { value: 8, unit: "h" };
+    this.working.travelPerDayPresets ??= [{ id: genId("tpd"), name: "Default", value: 8, unit: "h" }];
+    this.working.travelPerDay ??= { value: 8, unit: "h" }; // legacy mirror
     this.onDone = onDone;
   }
 
@@ -303,77 +317,54 @@ class TravelRulesPackEditorModal extends Modal {
       t.onChange((v) => (this.working.name = v.trim() || this.working.name));
     });
 
-    // Travel per day
-    contentEl.createEl("h3", { text: "Travel days" });
-    const travelDaysWrap = contentEl.createDiv({ cls: "zoommap-travel-days-row" });
+    // Max travel time presets (per day)
+    contentEl.createEl("h3", { text: "Max travel time presets" });
+    const perDayWrap = contentEl.createDiv();
 
-    let perDayUnitSelect: HTMLSelectElement | null = null;
+    const renderPerDayPresets = () => {
+      perDayWrap.empty();
+      const list = (this.working.travelPerDayPresets ??= []);
 
-    const collectTimeUnits = (): string[] => {
-      const set = new Set<string>();
-      for (const p of (this.working.travelTimePresets ?? [])) {
-        const u = (p.timeUnit ?? "").trim();
-        if (u) set.add(u);
-      }
-      return Array.from(set).sort((a, b) => a.localeCompare(b));
-    };
-
-    const refreshPerDayUnitOptions = () => {
-      if (!perDayUnitSelect) return;
-
-      const units = collectTimeUnits();
-      const current = (this.working.travelPerDay?.unit ?? "h").trim() || "h";
-
-      // clear
-      while (perDayUnitSelect.options.length) perDayUnitSelect.remove(0);
-
-      if (units.length === 0) {
-        const opt = document.createElement("option");
-        opt.value = current;
-        opt.textContent = current;
-        perDayUnitSelect.appendChild(opt);
-        perDayUnitSelect.value = current;
-        perDayUnitSelect.disabled = true;
-        return;
+      if (list.length === 0) {
+        perDayWrap.createEl("div", { text: "No max travel time presets." }).addClass("zoommap-muted");
       }
 
-      perDayUnitSelect.disabled = false;
-      for (const u of units) {
-        const opt = document.createElement("option");
-        opt.value = u;
-        opt.textContent = u;
-        perDayUnitSelect.appendChild(opt);
-      }
+      list.forEach((p, idx) => {
+        const row = perDayWrap.createDiv({ cls: "zoommap-travel-perday-row" });
 
-      const pick = units.includes(current) ? current : units[0];
-      perDayUnitSelect.value = pick;
-      this.working.travelPerDay.unit = pick;
-    };
+        const name = row.createEl("input", { type: "text" });
+        name.placeholder = "Name";
+        name.value = p.name ?? "";
+        name.oninput = () => { p.name = name.value.trim(); };
 
-    new Setting(travelDaysWrap)
-      .setName("Max travel time per day")
-      .setDesc("Used by the ruler 'travel days' option. Unit must match preset timeunit.")
-      .addText((t) => {
-        t.inputEl.type = "number";
-        t.inputEl.classList.add("zm-travel-num");
-        t.setValue(String(this.working.travelPerDay?.value ?? 8));
-        t.onChange((v) => {
-          const n = Number(String(v).replace(",", "."));
-          if (!Number.isFinite(n) || n <= 0) return;
-          this.working.travelPerDay.value = n;
-        });
-      })
-      .addDropdown((d) => {
-        const sel = (d as unknown as { selectEl: HTMLSelectElement }).selectEl;
-        perDayUnitSelect = sel;
-        perDayUnitSelect.classList.add("zm-travel-timeunit");
+        const val = row.createEl("input", { type: "number" });
+        val.placeholder = "8";
+        val.value = String(p.value ?? 8);
+        val.oninput = () => {
+          const n = Number(String(val.value).replace(",", "."));
+          if (Number.isFinite(n) && n > 0) p.value = n;
+        };
 
-        refreshPerDayUnitOptions();
+        const unit = row.createEl("input", { type: "text" });
+        unit.placeholder = "H";
+        unit.value = p.unit ?? "h";
+        unit.oninput = () => { p.unit = unit.value.trim() || "h"; };
 
-        d.onChange((v) => {
-          this.working.travelPerDay.unit = (v ?? "").trim() || "h";
-        });
+        const delBtn = row.createEl("button", { text: "Delete" });
+        delBtn.onclick = () => {
+          list.splice(idx, 1);
+          renderPerDayPresets();
+        };
       });
+
+      const addBtn = perDayWrap.createEl("button", { text: "Add max travel time" });
+      addBtn.onclick = () => {
+        list.push({ id: genId("tpd"), name: `Mode ${list.length + 1}`, value: 8, unit: "h" });
+        renderPerDayPresets();
+      };
+    };
+
+    renderPerDayPresets();
 
     // Custom units
     contentEl.createEl("h3", { text: "Custom units" });
@@ -554,13 +545,12 @@ class TravelRulesPackEditorModal extends Modal {
 
         const timeUnit = grid.createEl("input", { type: "text", cls: "zm-travel-timeunit" });
         timeUnit.value = p.timeUnit ?? "";
-        timeUnit.oninput = () => { p.timeUnit = timeUnit.value.trim(); refreshPerDayUnitOptions(); };
+        timeUnit.oninput = () => { p.timeUnit = timeUnit.value.trim(); };
 
         const del = grid.createEl("button", { text: "Delete" });
         del.onclick = () => {
           presets.splice(idx, 1);
           renderPresets();
-		  refreshPerDayUnitOptions();
         };
       });
 
@@ -575,7 +565,6 @@ class TravelRulesPackEditorModal extends Modal {
           timeUnit: "h",
         });
         renderPresets();
-		refreshPerDayUnitOptions();
       };
     };
     renderPresets();
@@ -591,7 +580,10 @@ class TravelRulesPackEditorModal extends Modal {
       this.original.customUnits = this.working.customUnits ?? [];
 	  this.original.terrains = this.working.terrains ?? [];
       this.original.travelTimePresets = this.working.travelTimePresets ?? [];
-      this.original.travelPerDay = this.working.travelPerDay ?? { value: 8, unit: "h" };
+      this.original.travelPerDayPresets = this.working.travelPerDayPresets ?? [];
+      // legacy mirror: keep first preset as old travelPerDay
+      const first = this.original.travelPerDayPresets[0];
+      this.original.travelPerDay = first ? { value: first.value, unit: first.unit } : { value: 8, unit: "h" };
       this.close();
       this.onDone({ action: "save", pack: this.original });
     };

@@ -49,6 +49,7 @@ export interface PingPreset {
   name: string;
   iconKey?: string;
   layerName?: string;
+  defaultScaleLikeSticker?: boolean;
 
   // radius menu entries (e.g. [2,5,10] with unit "km" or custom)
   distances: number[];
@@ -180,6 +181,13 @@ export interface TravelPerDayConfig {
   unit: string;
 }
 
+export interface TravelPerDayPreset {
+  id: string;
+  name: string;
+  value: number;
+  unit: string;
+}
+
 export interface TerrainDef {
   id: string;
   name: string;
@@ -193,14 +201,16 @@ export interface TravelRulesPack {
   customUnits: CustomUnitDef[];
   terrains: TerrainDef[];
   travelTimePresets: TravelTimePreset[];
-  travelPerDay: TravelPerDayConfig;
+  travelPerDayPresets?: TravelPerDayPreset[];
+  /** Legacy (deprecated): single max travel time */
+  travelPerDay?: TravelPerDayConfig;
 }
 
 export interface ZoomMapSettings {
   icons: IconProfile[];
   defaultIconKey: string;
   wheelZoomFactor: number;
-  panMouseButton: "left" | "middle";
+  panMouseButton: "left" | "middle" | "right";
   hoverMaxWidth: number;
   hoverMaxHeight: number;
   presets?: MarkerPreset[];
@@ -224,6 +234,7 @@ export interface ZoomMapSettings {
   travelTimePresets?: TravelTimePreset[];
   travelPerDay?: TravelPerDayConfig;
   travelRulesPacks?: TravelRulesPack[];
+  showLinkFileNameInTooltip?: boolean;
   svgRasterMaxScale?: 2 | 4 | 8;
   
   // Session image cache
@@ -473,6 +484,8 @@ export class MapInstance extends Component {
   private ready = false;
 
   private openMenu: ZMMenu | null = null;
+  private suppressContextMenuOnce = false;
+  private draggingViewButton: number | null = null;
 
   // Measurement state
   private measuring = false;
@@ -967,6 +980,78 @@ export class MapInstance extends Component {
         return;
       }
       new Notice("Default view stored in YAML.", 2000);
+  }
+  
+  private async deleteDefaultViewFromYaml(): Promise<void> {
+    const af = this.app.vault.getAbstractFileByPath(this.cfg.sourcePath);
+    if (!(af instanceof TFile)) {
+      new Notice("Source note not found.", 2500);
+      return;
+    }
+
+    let foundBlock = false;
+    let didChange = false;
+
+    await this.app.vault.process(af, (text) => {
+      const lines = text.split("\n");
+      const blk = this.findZoommapBlockForThisMap(lines);
+      if (!blk) return text;
+      foundBlock = true;
+
+      const blkPrefix = splitQuotePrefix(lines[blk.start] ?? "").prefix;
+      const content = lines.slice(blk.start + 1, blk.end);
+
+      const keyRe = /^(\s*)view\s*:/i;
+      let keyIdx = -1;
+      let keyIndent = "";
+
+      for (let i = 0; i < content.length; i++) {
+        const info = splitQuotePrefix(content[i]);
+        const m = keyRe.exec(info.rest);
+        if (m) {
+          keyIdx = i;
+          keyIndent = m[1] ?? "";
+          break;
+        }
+      }
+
+      if (keyIdx < 0) return text;
+
+      const isNextTopLevelKey = (ln: string) => {
+        const rest = stripQuotePrefix(ln);
+        const trimmed = rest.trim();
+        if (!trimmed) return false;
+        if (trimmed.startsWith("#")) return false;
+        const spaces = (/^\s*/.exec(rest))?.[0].length ?? 0;
+        return spaces <= keyIndent.length && /^[A-Za-z0-9_-]+\s*:/.test(trimmed);
+      };
+
+      let end = keyIdx + 1;
+      while (end < content.length && !isNextTopLevelKey(content[end])) end++;
+
+      const newContent = [
+        ...content.slice(0, keyIdx),
+        ...content.slice(end),
+      ];
+
+      if (newContent.join("\n") !== content.join("\n")) didChange = true;
+
+      return [
+        ...lines.slice(0, blk.start + 1),
+        ...newContent.map((ln) => (blkPrefix ? blkPrefix + stripQuotePrefix(ln) : ln)),
+        ...lines.slice(blk.end),
+      ].join("\n");
+    });
+
+    if (!foundBlock) {
+      new Notice("Could not locate zoommap block (embedded/callout?).", 3500);
+      return;
+    }
+    if (!didChange) {
+      new Notice("No default view found in YAML.", 2000);
+      return;
+    }
+    new Notice("Default view removed from YAML.", 2000);
   }
 
   private async applyViewEditorResult(cfg: ViewEditorConfig): Promise<void> {
@@ -3216,13 +3301,13 @@ export class MapInstance extends Component {
   private ensureMeasurement(): void {
     if (!this.data) return;
     this.data.measurement ??= {
-      displayUnit: "auto-metric",
+      displayUnit: "km",
       metersPerPixel: undefined,
       scales: {},
       travelTimePresetIds: [],
     };
     this.data.measurement.scales ??= {};
-    this.data.measurement.displayUnit ??= "auto-metric";
+    this.data.measurement.displayUnit ??= "km";
     this.data.measurement.travelTimePresetIds ??= [];
 	this.data.measurement.customUnitPxPerUnit ??= {};
   }
@@ -3264,7 +3349,7 @@ export class MapInstance extends Component {
 
     const px = this.computeDistancePixels();
     const meters = this.computeDistanceMeters();
-    const unit = this.data?.measurement?.displayUnit ?? "auto-metric";
+    const unit = (this.data?.measurement?.displayUnit as unknown as string) ?? "km";
 
     if (this.measuring || this.measurePts.length >= 2) {
       let distTxt = "No scale";
@@ -3359,7 +3444,7 @@ export class MapInstance extends Component {
 
  private formatDistance(m: number): string {
     const meas = this.data?.measurement;
-    const unit = meas?.displayUnit ?? "auto-metric";
+    const unit = (meas?.displayUnit as unknown as string) ?? "km";
     const round = (v: number, d = 2) =>
       Math.round(v * 10 ** d) / 10 ** d;
 
@@ -3394,17 +3479,8 @@ export class MapInstance extends Component {
         return `${round(m / 1609.344, 3)} mi`;
       case "ft":
         return `${Math.round(m / 0.3048)} ft`;
-      case "auto-imperial": {
-        const mi = m / 1609.344;
-        return mi >= 0.25
-          ? `${round(mi, 2)} mi`
-          : `${Math.round(m / 0.3048)} ft`;
-      }
-      case "auto-metric":
       default:
-        return m >= 1000
-          ? `${round(m / 1000, 2)} km`
-          : `${Math.round(m)} m`;
+        return `${round(m / 1000, 3)} km`;
     }
   }
   
@@ -3442,6 +3518,21 @@ export class MapInstance extends Component {
     const p = 10 ** decimals;
     return String(Math.round(v * p) / p);
   }
+  
+  private getSelectedTravelPerDayPreset(): { preset: TravelPerDayPreset | null; note?: string } {
+    const info = this.plugin.getActiveTravelPerDayPresets?.();
+    const presets = info?.presets ?? [];
+
+    const note = info?.multipleEnabled
+      ? `Multiple travel packs enabled; using "${info.packName ?? "first enabled"}".`
+      : undefined;
+
+    if (!presets.length) return { preset: null, note };
+
+    const selectedId = (this.data?.measurement?.travelDayPresetId ?? "").trim();
+    const picked = selectedId ? presets.find((p) => p.id === selectedId) : undefined;
+    return { preset: picked ?? presets[0], note };
+  }
 
   private computeTravelTimeLines(distanceMeters: number): string[] {
     const selected = new Set(this.data?.measurement?.travelTimePresetIds ?? []);
@@ -3449,23 +3540,12 @@ export class MapInstance extends Component {
 
     const presets = this.plugin.getActiveTravelTimePresets();
     const out: string[] = [];
-	
-    const perDayInfo = this.plugin.getActiveTravelPerDay();
-    const getTravelPerDay = (): { value: number | null; unit: string; note?: string } => {
-      if (!perDayInfo) return { value: null, unit: "" };
 
-      const value = Number.isFinite(perDayInfo.value) && perDayInfo.value > 0 ? perDayInfo.value : null;
-      const unit = (perDayInfo.unit ?? "").trim();
-      const note = perDayInfo.multipleEnabled
-        ? `Multiple travel packs enabled; using "${perDayInfo.packName ?? "first enabled"}".`
-        : undefined;
-
-      return { value, unit, note };
-    };
-
-    const perDay = getTravelPerDay();
-    const perDayValue = perDay.value;
-    const perDayUnit = perDay.unit;
+    const perDaySel = this.getSelectedTravelPerDayPreset();
+    const perDayPreset = perDaySel.preset;
+    const perDayValue = perDayPreset?.value ?? null;
+    const perDayUnit = (perDayPreset?.unit ?? "").trim();
+    const perDayName = (perDayPreset?.name ?? "").trim();
 
     const showDays = !!this.data?.measurement?.travelDaysEnabled;
 
@@ -3488,35 +3568,40 @@ export class MapInstance extends Component {
       const t = (distanceMeters / refMeters) * p.timeValue;
       out.push(`Time (${name}): ${this.formatTravelTimeNumber(t)} ${unit}`);
 
-      if (showDays) {
-        if (perDay.note) {
-          out.push(`Travel days: ${perDay.note}`);
-        }
-        if (!perDayValue || !perDayUnit) {
-          out.push("Travel days: not configured (set per-day unit/value in settings)");
-          continue;
-        }
+      if (!showDays) continue;
 
-        const presetUnitNorm = unit.trim().toLowerCase();
-        const perDayUnitNorm = perDayUnit.trim().toLowerCase();
+      if (perDaySel.note) out.push(`Travel days: ${perDaySel.note}`);
 
-        if (presetUnitNorm !== perDayUnitNorm) {
-          out.push(`Travel days: unit mismatch (preset: ${unit}, per-day: ${perDayUnit})`);
-          continue;
-        }
+      if (!perDayValue || !perDayUnit) {
+        out.push("Travel days: not configured (set per-day unit/value in settings)");
+        continue;
+      }
 
-        const total = t;
-        const fullDays = Math.floor(total / perDayValue);
-        const rest = total - fullDays * perDayValue;
+      const presetUnitNorm = unit.trim().toLowerCase();
+      const perDayUnitNorm = perDayUnit.trim().toLowerCase();
 
-        const restAbs = Math.abs(rest);
-        if (restAbs < 1e-6) {
-          out.push(`Travel days (${perDayValue} ${perDayUnit}/day): ${fullDays}d`);
-        } else if (fullDays <= 0) {
-          out.push(`Travel days (${perDayValue} ${perDayUnit}/day): 0d + ${this.formatTravelTimeNumber(rest)} ${unit}`);
-        } else {
-          out.push(`Travel days (${perDayValue} ${perDayUnit}/day): ${fullDays}d + ${this.formatTravelTimeNumber(rest)} ${unit}`);
-        }
+      if (presetUnitNorm !== perDayUnitNorm) {
+        out.push(`Travel days: unit mismatch (preset: ${unit}, max: ${perDayUnit})`);
+        continue;
+      }
+
+      const total = t;
+      const fullDays = Math.floor(total / perDayValue);
+      const rest = total - fullDays * perDayValue;
+
+      const restAbs = Math.abs(rest);
+      const label = perDayName ? ` (${perDayName})` : "";
+
+      if (restAbs < 1e-6) {
+        out.push(`Travel days${label} (${perDayValue} ${perDayUnit}/day): ${fullDays}d`);
+      } else if (fullDays <= 0) {
+        out.push(
+          `Travel days${label} (${perDayValue} ${perDayUnit}/day): 0d + ${this.formatTravelTimeNumber(rest)} ${unit}`,
+        );
+      } else {
+        out.push(
+          `Travel days${label} (${perDayValue} ${perDayUnit}/day): ${fullDays}d + ${this.formatTravelTimeNumber(rest)} ${unit}`,
+        );
       }
     }
 
@@ -3530,22 +3615,11 @@ export class MapInstance extends Component {
     const presets = this.plugin.getActiveTravelTimePresets();
     const out: string[] = [];
 
-    const perDayInfo = this.plugin.getActiveTravelPerDay();
-    const getTravelPerDay = (): { value: number | null; unit: string; note?: string } => {
-      if (!perDayInfo) return { value: null, unit: "" };
-
-      const value = Number.isFinite(perDayInfo.value) && perDayInfo.value > 0 ? perDayInfo.value : null;
-      const unit = (perDayInfo.unit ?? "").trim();
-      const note = perDayInfo.multipleEnabled
-        ? `Multiple travel packs enabled; using "${perDayInfo.packName ?? "first enabled"}".`
-        : undefined;
-
-      return { value, unit, note };
-    };
-
-    const perDay = getTravelPerDay();
-    const perDayValue = perDay.value;
-    const perDayUnit = perDay.unit;
+    const perDaySel = this.getSelectedTravelPerDayPreset();
+    const perDayPreset = perDaySel.preset;
+    const perDayValue = perDayPreset?.value ?? null;
+    const perDayUnit = (perDayPreset?.unit ?? "").trim();
+    const perDayName = (perDayPreset?.name ?? "").trim();
 
     const showDays = !!this.data?.measurement?.travelDaysEnabled;
 
@@ -3573,34 +3647,40 @@ export class MapInstance extends Component {
 
       out.push(`Time (${name}): ${this.formatTravelTimeNumber(t)} ${unit}`);
 
-      if (showDays) {
-        if (perDay.note) out.push(`Travel days: ${perDay.note}`);
+      if (!showDays) continue;
 
-        if (!perDayValue || !perDayUnit) {
-          out.push("Travel days: not configured (set per-day unit/value in settings)");
-          continue;
-        }
+      if (perDaySel.note) out.push(`Travel days: ${perDaySel.note}`);
 
-        const presetUnitNorm = unit.trim().toLowerCase();
-        const perDayUnitNorm = perDayUnit.trim().toLowerCase();
+      if (!perDayValue || !perDayUnit) {
+        out.push("Travel days: not configured (set per-day unit/value in settings)");
+        continue;
+      }
 
-        if (presetUnitNorm !== perDayUnitNorm) {
-          out.push(`Travel days: unit mismatch (preset: ${unit}, per-day: ${perDayUnit})`);
-          continue;
-        }
+      const presetUnitNorm = unit.trim().toLowerCase();
+      const perDayUnitNorm = perDayUnit.trim().toLowerCase();
 
-        const total = t;
-        const fullDays = Math.floor(total / perDayValue);
-        const rest = total - fullDays * perDayValue;
+      if (presetUnitNorm !== perDayUnitNorm) {
+        out.push(`Travel days: unit mismatch (preset: ${unit}, max: ${perDayUnit})`);
+        continue;
+      }
 
-        const restAbs = Math.abs(rest);
-        if (restAbs < 1e-6) {
-          out.push(`Travel days (${perDayValue} ${perDayUnit}/day): ${fullDays}d`);
-        } else if (fullDays <= 0) {
-          out.push(`Travel days (${perDayValue} ${perDayUnit}/day): 0d + ${this.formatTravelTimeNumber(rest)} ${unit}`);
-        } else {
-          out.push(`Travel days (${perDayValue} ${perDayUnit}/day): ${fullDays}d + ${this.formatTravelTimeNumber(rest)} ${unit}`);
-        }
+      const total = t;
+      const fullDays = Math.floor(total / perDayValue);
+      const rest = total - fullDays * perDayValue;
+
+      const restAbs = Math.abs(rest);
+      const label = perDayName ? ` (${perDayName})` : "";
+
+      if (restAbs < 1e-6) {
+        out.push(`Travel days${label} (${perDayValue} ${perDayUnit}/day): ${fullDays}d`);
+      } else if (fullDays <= 0) {
+        out.push(
+          `Travel days${label} (${perDayValue} ${perDayUnit}/day): 0d + ${this.formatTravelTimeNumber(rest)} ${unit}`,
+        );
+      } else {
+        out.push(
+          `Travel days${label} (${perDayValue} ${perDayUnit}/day): ${fullDays}d + ${this.formatTravelTimeNumber(rest)} ${unit}`,
+        );
       }
     }
 
@@ -3709,7 +3789,9 @@ export class MapInstance extends Component {
 
   private panButtonMatches(e: PointerEvent | MouseEvent): boolean {
     const want = this.plugin.settings.panMouseButton ?? "left";
-    return e.button === (want === "middle" ? 1 : 0);
+    if (want === "middle") return e.button === 1;
+    if (want === "right") return e.button === 2;
+    return e.button === 0;
   }
 
   private onPointerDownViewport(e: PointerEvent): void {
@@ -3751,6 +3833,7 @@ export class MapInstance extends Component {
     if (!this.panButtonMatches(e)) return;
 
     this.draggingView = true;
+	this.draggingViewButton = e.button;
 	this.lastPos = { x: e.clientX, y: e.clientY };
 
 	this.viewDragDist = 0;
@@ -3880,6 +3963,10 @@ export class MapInstance extends Component {
     const dy = e.clientY - this.lastPos.y;
 	this.viewDragDist += Math.hypot(dx, dy);
 	if (this.viewDragDist > 4) this.viewDragMoved = true;
+	
+    if (this.draggingViewButton === 2 && this.viewDragMoved) {
+      this.suppressContextMenuOnce = true;
+    }
     this.lastPos = { x: e.clientX, y: e.clientY };
 
     this.panAccDx += dx;
@@ -3928,6 +4015,7 @@ export class MapInstance extends Component {
   document.body.classList.remove("zm-cursor-grabbing");
 
   this.draggingView = false;
+  this.draggingViewButton = null;
   this.panAccDx = 0;
   this.panAccDy = 0;
   if (this.panRAF != null) {
@@ -4210,7 +4298,7 @@ this.viewDragDist = 0;
   /* ===== Collections helpers ===== */
   private getActiveBasePath(): string {
     if (!this.data) return this.cfg.imagePath;
-    return this.data.activeBase ?? this.data.image ?? this.cfg.imagePath;
+    return this.data.activeBase ?? this.getBasesNormalized()[0]?.path ?? this.cfg.imagePath;
   }
 
   private getCollectionsSplitForActive(): { matched: BaseCollection[]; globals: BaseCollection[] } {
@@ -4412,6 +4500,11 @@ this.viewDragDist = 0;
 private onContextMenuViewport(e: MouseEvent): void {
     if (!this.ready || !this.data) return;
     this.closeMenu();
+	
+    if ((this.plugin.settings.panMouseButton ?? "left") === "right" && this.suppressContextMenuOnce) {
+      this.suppressContextMenuOnce = false;
+      return;
+    }
 
     if ((this.drawingMode === "polygon" || this.drawingMode === "polyline") && this.drawPolygonPoints.length >= 2) {
       e.preventDefault();
@@ -4468,38 +4561,10 @@ private onContextMenuViewport(e: MouseEvent): void {
     }));
 
     const meas = this.data.measurement;
-    const currentUnit = meas?.displayUnit ?? "auto-metric";
+    const currentUnit = ((meas?.displayUnit as unknown as string) ?? "km");
     const currentCustomId = meas?.customUnitId;
 
     const unitItems: ZMMenuItem[] = [
-      {
-        label: "Auto (m/km)",
-        checked: currentUnit === "auto-metric",
-        action: () => {
-          this.ensureMeasurement();
-          if (this.data?.measurement) {
-            this.data.measurement.displayUnit = "auto-metric";
-            delete this.data.measurement.customUnitId;
-            void this.saveDataSoon();
-            this.updateMeasureHud();
-          }
-          this.closeMenu();
-        },
-      },
-      {
-        label: "Auto (mi/ft)",
-        checked: currentUnit === "auto-imperial",
-        action: () => {
-          this.ensureMeasurement();
-          if (this.data?.measurement) {
-            this.data.measurement.displayUnit = "auto-imperial";
-            delete this.data.measurement.customUnitId;
-            void this.saveDataSoon();
-            this.updateMeasureHud();
-          }
-          this.closeMenu();
-        },
-      },
       {
         label: "m",
         checked: currentUnit === "m",
@@ -5064,6 +5129,38 @@ private onContextMenuViewport(e: MouseEvent): void {
         checked: false,
       });
     }
+	
+    // --- Max travel time selection (per map) ---
+    travelTimeItems.push({ type: "separator" });
+
+    const perDayInfo = this.plugin.getActiveTravelPerDayPresets?.();
+    const perDayPresets = perDayInfo?.presets ?? [];
+    const selectedPerDayId = (this.data.measurement?.travelDayPresetId ?? "").trim();
+    const effectiveId = (selectedPerDayId && perDayPresets.some((p) => p.id === selectedPerDayId))
+      ? selectedPerDayId
+      : (perDayPresets[0]?.id ?? "");
+
+    travelTimeItems.push({
+      label: "Max travel time",
+      children: perDayPresets.length
+        ? perDayPresets.map((tpd) => ({
+            label: tpd.name || tpd.id,
+            checked: effectiveId === tpd.id,
+            action: (rowEl) => {
+              this.ensureMeasurement();
+              if (!this.data?.measurement) return;
+              this.data.measurement.travelDayPresetId = tpd.id;
+              void this.saveDataSoon();
+              this.updateMeasureHud();
+
+              const menu = rowEl.parentElement;
+              menu?.querySelectorAll<HTMLElement>(".zm-menu__check").forEach((c) => (c.textContent = ""));
+              const chk = rowEl.querySelector<HTMLElement>(".zm-menu__check");
+              if (chk) chk.textContent = "✓";
+            },
+          }))
+        : [{ label: "(No max travel time presets configured)", action: () => new Notice("Configure max travel time presets in settings → travel rules.", 3500) }],
+    });	
 
     items.push(
       { type: "separator" },
@@ -5395,6 +5492,13 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 			  this.closeMenu();
 			},
 		  },
+          {
+            label: "Delete default view",
+            action: () => {
+              void this.deleteDefaultViewFromYaml();
+              this.closeMenu();
+            },
+          },
 		],
 	  },
 	);
@@ -6381,7 +6485,8 @@ if (this.plugin.settings.enableTextLayers && this.data) {
       pingRadius: distanceValue,
       pingRadiusUnit: unit,
       pingRadiusCustomUnitId: unit === "custom" ? customUnitId : undefined,
-    };
+      scaleLikeSticker: preset.defaultScaleLikeSticker ? true : undefined,
+	};
 
     const folder = (preset.noteFolder ?? "ZoomMap/Pings").trim() || "ZoomMap/Pings";
     const baseName = this.sanitizeFileName(`Party - ${preset.name || "Party"} - ${distanceLabel} - ${marker.id}`);
@@ -8208,14 +8313,16 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     }
 
     const hasTooltipText = !!m.tooltip && m.tooltip.trim().length > 0;
+    const wantLinkNameTooltip =
+      !!this.plugin.settings.showLinkFileNameInTooltip && !!link;
     const wantInternalTooltip =
-      hasTooltipText && (!!m.tooltipAlwaysOn || !link);
+      (hasTooltipText && (!!m.tooltipAlwaysOn || !link)) || wantLinkNameTooltip;
 
     if (link) {
       const workspace = this.app.workspace;
 
       const forcePopover =
-        this.plugin.settings.forcePopoverWithoutModKey || hoverOverride;
+        this.plugin.settings.forcePopoverWithoutModKey === true || hoverOverride === true;
 
       const eventForPopover = forcePopover
         ? new MouseEvent("mousemove", {
@@ -8238,7 +8345,8 @@ if (this.plugin.settings.enableTextLayers && this.data) {
       });
 
       if (wantInternalTooltip) {
-        this.showInternalTooltip(ev, m);
+        const title = wantLinkNameTooltip ? this.getLinkDisplayName(link) : undefined;
+        this.showInternalTooltip(ev, m, { title });
       }
       return;
     }
@@ -8248,11 +8356,19 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     }
   }
 
-  private showInternalTooltip(ev: MouseEvent, m: Marker): void {
+  private getLinkDisplayName(link: string): string {
+    const f = this.resolveTFile(link, this.cfg.sourcePath);
+    if (f) return f.basename;
+    const raw = (link ?? "").split("#")[0] ?? "";
+    return basename(raw);
+  }
+
+  private showInternalTooltip(ev: MouseEvent, m: Marker, opts?: { title?: string }): void {
     if (!this.ready) return;
 
     const text = (m.tooltip ?? "").trim();
-    if (!text) return;
+    const title = (opts?.title ?? "").trim();
+    if (!text && !title) return;
 
     if (!this.tooltipEl) {
       this.tooltipEl = this.hudClipEl.createDiv({ cls: "zm-tooltip" });
@@ -8274,7 +8390,8 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     this.cancelHideTooltip();
     this.tooltipEl.empty();
 
-    this.tooltipEl.createEl("div", { text });
+    if (title) this.tooltipEl.createEl("div", { cls: "zm-tooltip__title", text: title });
+    if (text) this.tooltipEl.createEl("div", { cls: "zm-tooltip__body", text });
 
     this.positionTooltip(ev.clientX, ev.clientY);
     this.tooltipEl.classList.add("zm-tooltip-visible");
@@ -8477,7 +8594,6 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     this.updateSvgBaseFlag(path);
 
     this.data.activeBase = path;
-    this.data.image = path;
 
     if (this.isCanvas()) {
       await this.loadBaseSourceByPath(path);
@@ -8838,7 +8954,6 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
       this.data.bases = newBases;
       this.data.activeBase = newActive;
-      this.data.image = newActive;
       changed = true;
     }
 

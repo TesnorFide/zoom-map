@@ -117,6 +117,7 @@ const DEFAULT_SETTINGS: ZoomMapSettingsExtended = {
   panMouseButton: "left",
   hoverMaxWidth: 360,
   hoverMaxHeight: 260,
+  showLinkFileNameInTooltip: false,
   presets: [],
   stickerPresets: [],
   defaultWidth: "100%",
@@ -691,15 +692,17 @@ export default class ZoomMapPlugin extends Plugin {
     return packs.flatMap((p) => p.travelTimePresets ?? []);
   }
 
-  getActiveTravelPerDay(): { value: number; unit: string; packName?: string; multipleEnabled?: boolean } | null {
+  getActiveTravelPerDayPresets(): { presets: { id: string; name: string; value: number; unit: string }[]; packName?: string; multipleEnabled?: boolean } | null {
     const packs = this.getEnabledTravelPacks();
     if (packs.length === 0) return null;
 
     const first = packs[0];
-    const cfg = first.travelPerDay ?? { value: 8, unit: "h" };
-    const value = Number.isFinite(cfg.value) && cfg.value > 0 ? cfg.value : 8;
-    const unit = (cfg.unit ?? "").trim() || "h";
-    return { value, unit, packName: first.name, multipleEnabled: packs.length > 1 };
+    const presets = (first.travelPerDayPresets ?? []).filter((x) => !!x && typeof x.id === "string");
+    return {
+      presets,
+      packName: first.name,
+      multipleEnabled: packs.length > 1,
+    };
   }
   
   onunload(): void {
@@ -783,6 +786,7 @@ export default class ZoomMapPlugin extends Plugin {
     this.settings.travelPerDay.unit = (this.settings.travelPerDay.unit ?? "").trim() || "h";
 	this.settings.enableTextLayers ??= false;
 	this.settings.enableMeasurePro ??= false;
+	this.settings.showLinkFileNameInTooltip ??= false;
 	
     this.settings.enableSessionImageCache ??= false;
     this.settings.sessionImageCacheMb ??= 512;
@@ -982,7 +986,6 @@ export default class ZoomMapPlugin extends Plugin {
       (b) => b.path && b.path.trim().length > 0,
     );
     if (bases.length > 0) {
-      obj.image = bases[0].path;
       obj.imageBases = bases.map((b) =>
         b.name ? { path: b.path, name: b.name } : { path: b.path },
       );
@@ -1254,9 +1257,14 @@ class ZoomMapSettingTab extends PluginSettingTab {
       .addDropdown((d) => {
         d.addOption("left", "Left");
         d.addOption("middle", "Middle");
+		d.addOption("right", "Right");
         d.setValue(this.plugin.settings.panMouseButton ?? "left");
         d.onChange((v) => {
-          this.plugin.settings.panMouseButton = v === "middle" ? "middle" : "left";
+          const next =
+            v === "left" || v === "middle" || v === "right"
+              ? v
+              : "left";
+          this.plugin.settings.panMouseButton = next;
           void this.plugin.saveSettings();
         });
       });

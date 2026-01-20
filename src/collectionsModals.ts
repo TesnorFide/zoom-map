@@ -760,6 +760,15 @@ class PingPresetEditorModal extends Modal {
       t.setValue(this.working.layerName ?? "");
       t.onChange((v) => { this.working.layerName = v.trim() || undefined; });
     });
+	
+    new Setting(contentEl)
+      .setName("Scale like sticker (default)")
+      .setDesc("If enabled, newly created party pins will scale with the map (no inverse wrapper).")
+      .addToggle((tg) => {
+        tg.setValue(!!this.working.defaultScaleLikeSticker).onChange((on) => {
+          this.working.defaultScaleLikeSticker = on ? true : undefined;
+        });
+      });
 
     const packs = (this.plugin.settings.travelRulesPacks ?? []);
     new Setting(contentEl)

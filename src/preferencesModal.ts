@@ -78,7 +78,16 @@ export class PreferencesModal extends Modal {
       });
 	  
     // SVG raster quality (canvas)
-    contentEl.createEl("h3", { text: "Other preferences" });
+    contentEl.createEl("h3", { text: "Other preferences" });	
+    new Setting(contentEl)
+      .setName("Show linked file name on hover")
+      .setDesc("Shows the linked note’s filename inside the map tooltip. Useful when linked notes are still empty.")
+      .addToggle((toggle) => {
+        toggle.setValue(!!this.plugin.settings.showLinkFileNameInTooltip).onChange(async (value) => {
+          this.plugin.settings.showLinkFileNameInTooltip = value;
+          await this.plugin.saveSettings();
+        });
+      });
     new Setting(contentEl)
       .setName("Max SVG raster scale")
       .setDesc("Controls the maximum raster lod for SVG base images. Higher = sharper at high zoom, but more RAM and slower upgrades.")

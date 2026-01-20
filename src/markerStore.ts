@@ -190,8 +190,6 @@ export type DistanceUnit =
   | "km"
   | "mi"
   | "ft"
-  | "auto-metric"
-  | "auto-imperial"
   | "custom";
 
 export interface MeasurementConfig {
@@ -202,10 +200,12 @@ export interface MeasurementConfig {
   customUnitPxPerUnit?: Record<string, Record<string, number>>;
   travelTimePresetIds?: string[];
   travelDaysEnabled?: boolean;
+  travelDayPresetId?: string;
 }
 
 export interface MarkerFileData {
-  image: string;
+  /** Legacy field (deprecated): do not write anymore, still read for migration/back-compat */
+  image?: string;
   size?: { w: number; h: number };
   layers: MarkerLayer[];
   markers: Marker[];
@@ -232,6 +232,20 @@ export function generateId(prefix = "m"): string {
   return `${prefix}_${s}`;
 }
 
+export function sanitizeMarkerFileDataForSave(data: MarkerFileData): MarkerFileData {
+  const out: MarkerFileData = { ...data };
+
+  delete out.image;
+
+  const du = (out.measurement?.displayUnit as unknown as string | undefined) ?? "";
+  if (out.measurement && du) {
+    if (du === "auto-metric") out.measurement.displayUnit = "km";
+    else if (du === "auto-imperial") out.measurement.displayUnit = "mi";
+  }
+
+  return out;
+}
+
 export class MarkerStore {
   private app: App;
   private sourcePath: string;
@@ -245,6 +259,10 @@ export class MarkerStore {
 
   getPath(): string {
     return this.markersFilePath;
+  }
+  
+  private serialize(data: MarkerFileData): string {
+    return JSON.stringify(sanitizeMarkerFileDataForSave(data), null, 2);
   }
 
   async ensureExists(
@@ -266,7 +284,6 @@ export class MarkerStore {
         : [{ id: "default", name: "Default", visible: true, locked: false }];
 
     const data: MarkerFileData = {
-      image: initialImagePath ?? "",
       size,
       layers: baseLayers,
       markers: [],
@@ -274,13 +291,13 @@ export class MarkerStore {
       overlays: [],
       activeBase: initialImagePath ?? "",
       measurement: {
-        displayUnit: "auto-metric",
         metersPerPixel: undefined,
         scales: {},
         customUnitId: undefined,
 		customUnitPxPerUnit: {},
         travelTimePresetIds: [],
         travelDaysEnabled: false,
+		travelDayPresetId: undefined,
       },
       frame: undefined,
       pinSizeOverrides: {},
@@ -290,7 +307,7 @@ export class MarkerStore {
 	  textLayers: [],
     };
 
-    await this.create(JSON.stringify(data, null, 2));
+    await this.create(this.serialize(data));
     new Notice(`Created marker file: ${this.markersFilePath}`, 2500);
   }
 
@@ -332,24 +349,35 @@ export class MarkerStore {
         : isBaseImage(firstBase)
         ? firstBase.path
         : "";
-    parsed.activeBase = parsed.image || firstPath || "";
+    parsed.activeBase = parsed.activeBase || parsed.image || firstPath || "";
   }
 
   parsed.overlays ??= [];
 
   parsed.measurement ??= {
-    displayUnit: "auto-metric",
+    displayUnit: "km",
     metersPerPixel: undefined,
     scales: {},
   };
   parsed.measurement.scales ??= {};
-  parsed.measurement.displayUnit ??= "auto-metric";
+  // normalize + back-compat: auto-* -> km/mi
+  {
+    const raw = (parsed.measurement.displayUnit as unknown as string | undefined) ?? "";
+    if (raw === "auto-metric") parsed.measurement.displayUnit = "km";
+    else if (raw === "auto-imperial") parsed.measurement.displayUnit = "mi";
+    else if (raw !== "m" && raw !== "km" && raw !== "mi" && raw !== "ft" && raw !== "custom") {
+      parsed.measurement.displayUnit = "km";
+    }
+  }
   parsed.measurement.customUnitPxPerUnit ??= {};
   if (!Array.isArray(parsed.measurement.travelTimePresetIds)) {
   parsed.measurement.travelTimePresetIds = [];
 }
   if (typeof parsed.measurement.travelDaysEnabled !== "boolean") {
     parsed.measurement.travelDaysEnabled = false;
+  }
+  if (typeof parsed.measurement.travelDayPresetId !== "string" || !parsed.measurement.travelDayPresetId.trim()) {
+    delete parsed.measurement.travelDayPresetId;
   }
 
   // Per-map pin size overrides
@@ -369,7 +397,7 @@ export class MarkerStore {
 
   async save(data: MarkerFileData): Promise<void> {
     const f = this.getFileByPath(this.markersFilePath);
-    const content = JSON.stringify(data, null, 2);
+    const content = this.serialize(data);
     if (!f) {
       await this.create(content);
     } else {
@@ -379,7 +407,7 @@ export class MarkerStore {
 
   async wouldChange(data: MarkerFileData): Promise<boolean> {
     const f = this.getFileByPath(this.markersFilePath);
-    const next = JSON.stringify(data, null, 2);
+    const next = this.serialize(data);
     if (!f) return true;
     const cur = await this.app.vault.read(f);
     return cur !== next;

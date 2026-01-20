@@ -1,6 +1,6 @@
 import { TFile } from "obsidian";
 import type { App } from "obsidian";
-import type { MarkerFileData } from "./markerStore";
+import { sanitizeMarkerFileDataForSave, type MarkerFileData } from "./markerStore";
 
 export class NoteMarkerStore {
   private app: App;
@@ -85,7 +85,6 @@ export class NoteMarkerStore {
         : [{ id: "default", name: "Default", visible: true, locked: false }];
 
     const data: MarkerFileData = {
-      image: initialImagePath ?? "",
       size,
       layers: baseLayers,
       markers: [],
@@ -93,13 +92,14 @@ export class NoteMarkerStore {
       overlays: [],
       activeBase: initialImagePath ?? "",
       measurement: {
-        displayUnit: "auto-metric",
+        displayUnit: "km",
         metersPerPixel: undefined,
         scales: {},
         customUnitId: undefined,
 		customUnitPxPerUnit: {},
         travelTimePresetIds: [],
         travelDaysEnabled: false,
+		travelDayPresetId: undefined,
       },
       frame: undefined,
       pinSizeOverrides: {},
@@ -109,7 +109,7 @@ export class NoteMarkerStore {
 	  textLayers: [],
     };
 
-    const payload = JSON.stringify(data, null, 2);
+    const payload = JSON.stringify(sanitizeMarkerFileDataForSave(data), null, 2);
     const header = this.headerLine();
     const footer = this.footerLine();
     const block = `\n%%\n${header}\n${payload}\n${footer}\n%%\n`;
@@ -139,7 +139,7 @@ export class NoteMarkerStore {
     const { file } = await this.readNote();
     const header = this.headerLine();
     const footer = this.footerLine();
-    const payload = JSON.stringify(data, null, 2);
+    const payload = JSON.stringify(sanitizeMarkerFileDataForSave(data), null, 2);
 
     await this.app.vault.process(file, (text) => {
       const blk = this.findBlock(text);
@@ -156,8 +156,8 @@ export class NoteMarkerStore {
   async wouldChange(data: MarkerFileData): Promise<boolean> {
     try {
       const cur = await this.load();
-      const a = JSON.stringify(cur, null, 2);
-      const b = JSON.stringify(data, null, 2);
+      const a = JSON.stringify(sanitizeMarkerFileDataForSave(cur), null, 2);
+      const b = JSON.stringify(sanitizeMarkerFileDataForSave(data), null, 2);
       return a !== b;
     } catch {
       return true;

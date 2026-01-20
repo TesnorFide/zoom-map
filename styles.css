@@ -63,12 +63,20 @@ button.zm-btn-sm {
   gap: 8px;
 }
 
+.modal.zoommap-modal--travel .zoommap-travel-perday-row {
+  display: grid;
+  grid-template-columns: 20ch 9ch 9ch auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
 .modal.zoommap-modal--travel .zoommap-custom-unit-row .zm-cu-abbr {
   width: 5ch;
 }
 
 .modal.zoommap-modal--travel .zoommap-custom-unit-row .zm-cu-factor {
-  width: 9ch;
+  width: 6ch;
 }
 
 /* Travel presets grid in travel modal: make unit/time-unit tighter */
@@ -415,6 +423,14 @@ button.zm-btn-sm {
 
 .zm-tooltip.zm-tooltip-visible {
   display: block;
+}
+
+.zm-tooltip__title {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.zm-tooltip__body {
+  white-space: pre-wrap;
 }
 
 /* Measure overlay (ruler) */
