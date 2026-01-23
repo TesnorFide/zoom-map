@@ -2419,7 +2419,10 @@ var CollectionEditorModal = class extends import_obsidian11.Modal {
           travelPackId: (_b2 = ((_a2 = this.plugin.settings.travelRulesPacks) != null ? _a2 : [])[0]) == null ? void 0 : _b2.id,
           noteFolder: "ZoomMap/Pings",
           filterTags: [],
-          filterProps: {}
+          filterProps: {},
+          relatedLookup: "tags",
+          searchLayersMode: "all",
+          searchLayerNames: []
         };
         pings.push(pp);
         renderPings();
@@ -2645,10 +2648,14 @@ var SwapFramesEditorModal = class extends import_obsidian11.Modal {
 };
 var PingPresetEditorModal = class extends import_obsidian11.Modal {
   constructor(app, plugin, preset, onSave) {
+    var _a, _b, _c, _d, _e, _f;
     super(app);
     this.plugin = plugin;
     this.working = deepClone(preset);
     this.onSave = onSave;
+    (_b = (_a = this.working).relatedLookup) != null ? _b : _a.relatedLookup = "tags";
+    (_d = (_c = this.working).searchLayersMode) != null ? _d : _c.searchLayersMode = "all";
+    (_f = (_e = this.working).searchLayerNames) != null ? _f : _e.searchLayerNames = [];
   }
   onOpen() {
     var _a;
@@ -2680,6 +2687,51 @@ var PingPresetEditorModal = class extends import_obsidian11.Modal {
         this.working.iconKey = v || void 0;
       });
     });
+    new import_obsidian11.Setting(contentEl).setName("Related notes lookup").setDesc("Expands the search starting from the in-range linked notes.").addDropdown((d) => {
+      var _a2;
+      d.addOption("off", "Off");
+      d.addOption("backlinks", "Backlinks (notes linking to the in-range note)");
+      d.addOption("tags", "Tags (notes with matching tags)");
+      d.setValue((_a2 = this.working.relatedLookup) != null ? _a2 : "tags");
+      d.onChange((v) => {
+        if (v === "off" || v === "tags" || v === "backlinks") {
+          this.working.relatedLookup = v;
+        } else {
+          this.working.relatedLookup = "tags";
+        }
+      });
+    });
+    let customLayersSetting = null;
+    const renderCustomLayersSetting = () => {
+      var _a2;
+      if (!customLayersSetting) return;
+      customLayersSetting.settingEl.toggle(((_a2 = this.working.searchLayersMode) != null ? _a2 : "all") === "custom");
+    };
+    new import_obsidian11.Setting(contentEl).setName("Search markers in layers").setDesc("Limits which marker layers are considered when scanning for in-range markers. Custom uses layer *names* (comma separated).").addDropdown((d) => {
+      var _a2;
+      d.addOption("all", "All layers");
+      d.addOption("self", "Only the party pin's layer");
+      d.addOption("custom", "Custom list");
+      d.setValue((_a2 = this.working.searchLayersMode) != null ? _a2 : "all");
+      d.onChange((v) => {
+        if (v === "all" || v === "self" || v === "custom") {
+          this.working.searchLayersMode = v;
+        } else {
+          this.working.searchLayersMode = "all";
+        }
+        renderCustomLayersSetting();
+      });
+    });
+    customLayersSetting = new import_obsidian11.Setting(contentEl).setName("Layer names (comma separated)").setDesc('Example: "npc, shops, quests". If empty, all layers are searched.').addText((t) => {
+      var _a2;
+      t.setPlaceholder("Npc, shops");
+      t.setValue(((_a2 = this.working.searchLayerNames) != null ? _a2 : []).join(", "));
+      t.onChange((v) => {
+        const arr = v.split(",").map((s) => s.trim()).filter(Boolean);
+        this.working.searchLayerNames = arr;
+      });
+    });
+    renderCustomLayersSetting();
     new import_obsidian11.Setting(contentEl).setName("Layer name (optional)").addText((t) => {
       var _a2;
       t.setPlaceholder("Pings");
@@ -8374,6 +8426,78 @@ var MapInstance = class extends import_obsidian16.Component {
     }
     return true;
   }
+  resolvePingSearchLayerIds(ping, preset) {
+    var _a, _b, _c;
+    if (!this.data) return null;
+    const mode = (_a = preset == null ? void 0 : preset.searchLayersMode) != null ? _a : "all";
+    if (mode === "self") {
+      return /* @__PURE__ */ new Set([ping.layer]);
+    }
+    if (mode === "custom") {
+      const names = ((_b = preset == null ? void 0 : preset.searchLayerNames) != null ? _b : []).map((s) => (s != null ? s : "").trim()).filter(Boolean);
+      if (names.length === 0) return null;
+      const ids = new Set(
+        ((_c = this.data.layers) != null ? _c : []).filter((l) => {
+          var _a2;
+          return names.includes(((_a2 = l.name) != null ? _a2 : "").trim());
+        }).map((l) => l.id)
+      );
+      if (ids.size === 0) return null;
+      return ids;
+    }
+    return null;
+  }
+  buildTagIndexForTags(want) {
+    const index = /* @__PURE__ */ new Map();
+    if (want.size === 0) return index;
+    const files = this.app.vault.getFiles().filter((f) => {
+      var _a;
+      return ((_a = f.extension) == null ? void 0 : _a.toLowerCase()) === "md";
+    });
+    for (const f of files) {
+      const tags = this.collectTagsForFile(f);
+      for (const norm of tags.keys()) {
+        if (!want.has(norm)) continue;
+        const arr = index.get(norm);
+        if (arr) arr.push(f);
+        else index.set(norm, [f]);
+      }
+    }
+    return index;
+  }
+  backlinkPathsFromResolvedLinks(target) {
+    const out = [];
+    const mcAny = this.app.metadataCache;
+    const rl = mcAny.resolvedLinks;
+    if (!rl) return out;
+    const addIfLinksTo = (srcPath, dests) => {
+      if (!srcPath || srcPath === target.path) return;
+      if (dests && typeof dests === "object") {
+        if (dests instanceof Map) {
+          if (dests.has(target.path)) out.push(srcPath);
+          return;
+        }
+        const obj = dests;
+        if (Object.prototype.hasOwnProperty.call(obj, target.path)) out.push(srcPath);
+      }
+    };
+    if (rl instanceof Map) {
+      for (const [srcPath, dests] of rl.entries()) {
+        if (typeof srcPath !== "string") continue;
+        addIfLinksTo(srcPath, dests);
+      }
+      return out;
+    }
+    if (typeof rl === "object") {
+      for (const [srcPath, dests] of Object.entries(rl)) {
+        addIfLinksTo(srcPath, dests);
+      }
+    }
+    return out;
+  }
+  getBacklinkSourcePaths(target) {
+    return this.backlinkPathsFromResolvedLinks(target);
+  }
   buildTagIndex() {
     const index = /* @__PURE__ */ new Map();
     const files = this.app.vault.getFiles().filter((f) => {
@@ -8614,7 +8738,7 @@ ${baseYaml}
     new import_obsidian16.Notice("Party pin created.", 1200);
   }
   async updatePingNoteForMarker(ping) {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     if (!this.data) return;
     if (ping.type !== "ping") return;
     const notePath = (_a = ping.pingNotePath) != null ? _a : "";
@@ -8625,6 +8749,8 @@ ${baseYaml}
     const customUnitId = ping.pingRadiusCustomUnitId;
     const radiusPx = this.pingToPixels(radius, unit, customUnitId);
     if (radiusPx == null) return;
+    const preset = ping.pingPresetId ? this.findPingPresetById(ping.pingPresetId) : void 0;
+    const allowedLayerIds = this.resolvePingSearchLayerIds(ping, preset);
     const inRangePaths = /* @__PURE__ */ new Set();
     const distances = {};
     const tooltipMap = /* @__PURE__ */ new Map();
@@ -8632,6 +8758,7 @@ ${baseYaml}
       if (m.id === ping.id) continue;
       if (m.anchorSpace === "viewport") continue;
       if (m.type === "ping") continue;
+      if (allowedLayerIds && !allowedLayerIds.has(m.layer)) continue;
       const dx = (m.x - ping.x) * this.imgW;
       const dy = (m.y - ping.y) * this.imgH;
       const pxDist = Math.hypot(dx, dy);
@@ -8690,44 +8817,85 @@ ${baseYaml}
     const unitLabel = this.pingUnitLabel(unit, customUnitId);
     const tooltipsSorted = Array.from(tooltipMap.entries()).sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]));
     const tooltipLines = tooltipsSorted.length === 0 ? ["*(none)*"] : tooltipsSorted.map(([txt, d]) => `- ${txt} (${d} ${unitLabel})`);
-    const preset = ping.pingPresetId ? this.findPingPresetById(ping.pingPresetId) : void 0;
-    const excludeTagNorms = new Set(
-      ((_f = preset == null ? void 0 : preset.filterTags) != null ? _f : []).map((t) => this.normalizeTagForIndex(t)).filter(Boolean)
-    );
+    const relatedMode = (_f = preset == null ? void 0 : preset.relatedLookup) != null ? _f : "tags";
+    let relatedBody = "";
     const inRangeFiles = listSorted.map((p) => this.app.vault.getAbstractFileByPath(p)).filter((x) => x instanceof import_obsidian16.TFile).map((file) => {
       var _a2;
       return { file, dist: (_a2 = distances[file.path]) != null ? _a2 : 0 };
     }).filter(({ file }) => this.fileMatchesPartyFilters(file, preset)).sort((a, b) => a.dist - b.dist || a.file.path.localeCompare(b.file.path));
-    const candidates = inRangeFiles.map(({ file, dist }) => {
-      const tags = this.collectTagsForFile(file);
-      for (const ex of excludeTagNorms) tags.delete(ex);
-      const norms = [...tags.keys()].sort((aa, bb) => {
-        var _a2, _b2;
-        const aTag = (_a2 = tags.get(aa)) != null ? _a2 : aa;
-        const bTag = (_b2 = tags.get(bb)) != null ? _b2 : bb;
-        return aTag.localeCompare(bTag, void 0, { sensitivity: "base" });
-      });
-      return { file, dist, tags, norms };
-    }).filter((c) => c.norms.length > 0);
-    let relatedBody = "";
-    if (candidates.length > 0) {
-      const tagIndex = this.buildTagIndex();
-      const tables = [];
-      for (const c of candidates) {
-        const pinLabel = `${this.formatWikiLink(c.file, af.path)} (${c.dist} ${unitLabel})`;
-        const lines = [];
-        lines.push(`| ${pinLabel} | Notes with tag |`);
-        lines.push("| --- | --- |");
-        for (const norm of c.norms) {
-          const displayTag = (_g = c.tags.get(norm)) != null ? _g : `#${norm}`;
-          const matches = ((_h = tagIndex.get(norm)) != null ? _h : []).filter((f) => f.path !== c.file.path && f.path !== af.path).sort((a, b) => a.basename.localeCompare(b.basename, void 0, { sensitivity: "base" }));
-          const links = matches.map((f) => this.formatWikiLink(f, af.path));
-          const cell = links.length ? links.join("<br>") : "*(none)*";
-          lines.push(`| ${this.escapeTableCell(displayTag)} | ${cell} |`);
+    try {
+      if (relatedMode === "off") {
+        relatedBody = "*(disabled)*";
+      } else if (relatedMode === "backlinks") {
+        const maxPerNote = 50;
+        const blocks = [];
+        if (inRangeFiles.length === 0) {
+          relatedBody = "*(none)*";
+        } else {
+          for (const c of inRangeFiles) {
+            const pinLabel = `${this.formatWikiLink(c.file, af.path)} (${c.dist} ${unitLabel})`;
+            const lines = [];
+            lines.push(`| ${pinLabel} | Backlinks |`);
+            lines.push("| --- | --- |");
+            const sourcePaths = this.getBacklinkSourcePaths(c.file);
+            const sources = sourcePaths.map((p) => this.app.vault.getAbstractFileByPath(p)).filter((x) => x instanceof import_obsidian16.TFile).filter((f) => f.path !== c.file.path && f.path !== af.path).sort((a, b) => a.basename.localeCompare(b.basename, void 0, { sensitivity: "base" }));
+            const slice = sources.slice(0, maxPerNote);
+            const rest = sources.length - slice.length;
+            const links = slice.map((f) => this.formatWikiLink(f, af.path));
+            const cell = links.length ? links.join("<br>") + (rest > 0 ? `<br>\u2026 +${rest} more` : "") : "*(none)*";
+            lines.push(`| Backlinks | ${cell} |`);
+            blocks.push(lines.join("\n"));
+          }
+          relatedBody = blocks.join("\n\n").trim() || "*(none)*";
         }
-        tables.push(lines.join("\n"));
+      } else {
+        const excludeTagNorms = new Set(
+          ((_g = preset == null ? void 0 : preset.filterTags) != null ? _g : []).map((t) => this.normalizeTagForIndex(t)).filter(Boolean)
+        );
+        const candidates = inRangeFiles.map(({ file, dist }) => {
+          const tags = this.collectTagsForFile(file);
+          for (const ex of excludeTagNorms) tags.delete(ex);
+          const norms = [...tags.keys()].sort((aa, bb) => {
+            var _a2, _b2;
+            const aTag = (_a2 = tags.get(aa)) != null ? _a2 : aa;
+            const bTag = (_b2 = tags.get(bb)) != null ? _b2 : bb;
+            return aTag.localeCompare(bTag, void 0, { sensitivity: "base" });
+          });
+          return { file, dist, tags, norms };
+        }).filter((c) => c.norms.length > 0);
+        if (candidates.length === 0) {
+          relatedBody = "*(none)*";
+        } else {
+          const wantNorms = /* @__PURE__ */ new Set();
+          for (const c of candidates) for (const n of c.norms) wantNorms.add(n);
+          const tagIndex = this.buildTagIndexForTags(wantNorms);
+          const maxPerTag = 50;
+          const tables = [];
+          for (const c of candidates) {
+            const pinLabel = `${this.formatWikiLink(c.file, af.path)} (${c.dist} ${unitLabel})`;
+            const lines = [];
+            lines.push(`| ${pinLabel} | Notes with tag |`);
+            lines.push("| --- | --- |");
+            for (const norm of c.norms) {
+              const displayTag = (_h = c.tags.get(norm)) != null ? _h : `#${norm}`;
+              const matches = ((_i = tagIndex.get(norm)) != null ? _i : []).filter((f) => f.path !== c.file.path && f.path !== af.path).sort((a, b) => a.basename.localeCompare(b.basename, void 0, { sensitivity: "base" }));
+              const slice = matches.slice(0, maxPerTag);
+              const rest = matches.length - slice.length;
+              const links = slice.map((f) => this.formatWikiLink(f, af.path));
+              const cell = links.length ? links.join("<br>") + (rest > 0 ? `<br>\u2026 +${rest} more` : "") : "*(none)*";
+              lines.push(`| ${this.escapeTableCell(displayTag)} | ${cell} |`);
+            }
+            tables.push(lines.join("\n"));
+          }
+          relatedBody = tables.join("\n\n").trim() || "*(none)*";
+        }
       }
-      relatedBody = tables.join("\n\n").trim();
+    } catch (e) {
+      console.warn("Zoom Map: related section build failed", e);
+      relatedBody = "*(error building related section)*";
+    }
+    if (!relatedBody.trim()) {
+      relatedBody = "*(none)*";
     }
     const dummyPreset = preset != null ? preset : { id: "", name: "", distances: [], unit: "km" };
     const baseYamlFallback = this.buildPingBaseYaml(dummyPreset, unitLabel);

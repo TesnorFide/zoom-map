@@ -437,6 +437,9 @@ export class CollectionEditorModal extends Modal {
           noteFolder: "ZoomMap/Pings",
           filterTags: [],
           filterProps: {},
+          relatedLookup: "tags",
+          searchLayersMode: "all",
+          searchLayerNames: [],
         };
         pings.push(pp);
         renderPings();
@@ -731,6 +734,10 @@ class PingPresetEditorModal extends Modal {
     this.plugin = plugin;
     this.working = deepClone(preset);
     this.onSave = onSave;
+
+    this.working.relatedLookup ??= "tags";
+    this.working.searchLayersMode ??= "all";
+    this.working.searchLayerNames ??= [];	
   }
 
   onOpen(): void {
@@ -754,6 +761,60 @@ class PingPresetEditorModal extends Modal {
       d.setValue(this.working.iconKey ?? "");
       d.onChange((v) => { this.working.iconKey = v || undefined; });
     });
+
+    new Setting(contentEl)
+      .setName("Related notes lookup")
+      .setDesc("Expands the search starting from the in-range linked notes.")
+      .addDropdown((d) => {
+        d.addOption("off", "Off");
+        d.addOption("backlinks", "Backlinks (notes linking to the in-range note)");
+        d.addOption("tags", "Tags (notes with matching tags)");
+        d.setValue(this.working.relatedLookup ?? "tags");
+        d.onChange((v) => {
+          if (v === "off" || v === "tags" || v === "backlinks") {
+            this.working.relatedLookup = v;
+          } else {
+            this.working.relatedLookup = "tags";
+          }
+        });
+      });
+
+    let customLayersSetting: Setting | null = null;
+    const renderCustomLayersSetting = () => {
+      if (!customLayersSetting) return;
+      customLayersSetting.settingEl.toggle((this.working.searchLayersMode ?? "all") === "custom");
+    };
+
+    new Setting(contentEl)
+      .setName("Search markers in layers")
+      .setDesc("Limits which marker layers are considered when scanning for in-range markers. Custom uses layer *names* (comma separated).")
+      .addDropdown((d) => {
+        d.addOption("all", "All layers");
+        d.addOption("self", "Only the party pin's layer");
+        d.addOption("custom", "Custom list");
+        d.setValue(this.working.searchLayersMode ?? "all");
+        d.onChange((v) => {
+          if (v === "all" || v === "self" || v === "custom") {
+            this.working.searchLayersMode = v;
+          } else {
+            this.working.searchLayersMode = "all";
+          }
+          renderCustomLayersSetting();
+        });
+      });
+
+    customLayersSetting = new Setting(contentEl)
+      .setName("Layer names (comma separated)")
+      .setDesc('Example: "npc, shops, quests". If empty, all layers are searched.')
+      .addText((t) => {
+        t.setPlaceholder("Npc, shops");
+        t.setValue((this.working.searchLayerNames ?? []).join(", "));
+        t.onChange((v) => {
+          const arr = v.split(",").map((s) => s.trim()).filter(Boolean);
+          this.working.searchLayerNames = arr;
+        });
+      });
+    renderCustomLayersSetting();
 
     new Setting(contentEl).setName("Layer name (optional)").addText((t) => {
       t.setPlaceholder("Pings");

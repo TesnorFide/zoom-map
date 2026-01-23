@@ -65,6 +65,11 @@ export interface PingPreset {
   // optional extra filters for the embedded Bases view
   filterTags?: string[];                 // OR tags; e.g. ["npc","shop"]
   filterProps?: Record<string, string>;  // AND props; e.g. { type: "npc" }
+
+  // Related notes section: how to expand search starting from in-range notes
+  relatedLookup?: "off" | "tags" | "backlinks";
+  searchLayersMode?: "all" | "self" | "custom";
+  searchLayerNames?: string[]; // used when searchLayersMode === "custom"
 }
 
 export interface StickerPreset {
@@ -6290,6 +6295,94 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
     return true;
   }
+  
+  private resolvePingSearchLayerIds(ping: Marker, preset?: PingPreset): Set<string> | null {
+    if (!this.data) return null;
+
+    const mode = preset?.searchLayersMode ?? "all";
+    if (mode === "self") {
+      return new Set([ping.layer]);
+    }
+
+    if (mode === "custom") {
+      const names = (preset?.searchLayerNames ?? []).map((s) => (s ?? "").trim()).filter(Boolean);
+      if (names.length === 0) return null; // treat empty as "all"
+
+      const ids = new Set(
+        (this.data.layers ?? [])
+          .filter((l) => names.includes((l.name ?? "").trim()))
+          .map((l) => l.id),
+      );
+
+      // If the user configured names that don't exist on this map, fall back to "all" to avoid "broken" pings.
+      if (ids.size === 0) return null;
+      return ids;
+    }
+
+    return null; // all layers
+  }
+
+  private buildTagIndexForTags(want: Set<string>): Map<string, TFile[]> {
+    const index = new Map<string, TFile[]>();
+    if (want.size === 0) return index;
+
+    const files = this.app.vault.getFiles().filter((f) => f.extension?.toLowerCase() === "md");
+    for (const f of files) {
+      const tags = this.collectTagsForFile(f);
+      for (const norm of tags.keys()) {
+        if (!want.has(norm)) continue;
+        const arr = index.get(norm);
+        if (arr) arr.push(f);
+        else index.set(norm, [f]);
+      }
+    }
+    return index;
+  }
+  
+  private backlinkPathsFromResolvedLinks(target: TFile): string[] {
+    const out: string[] = [];
+
+    const mcAny = this.app.metadataCache as unknown as {
+      resolvedLinks?: unknown;
+    };
+    const rl = mcAny.resolvedLinks;
+    if (!rl) return out;
+
+    // resolvedLinks: Record<srcPath, Record<destPath, number>> (most common)
+    // Some builds may use Map-like structures; handle both.
+    const addIfLinksTo = (srcPath: string, dests: unknown) => {
+      if (!srcPath || srcPath === target.path) return;
+
+      if (dests && typeof dests === "object") {
+        if (dests instanceof Map) {
+          if (dests.has(target.path)) out.push(srcPath);
+          return;
+        }
+        const obj = dests as Record<string, unknown>;
+        if (Object.prototype.hasOwnProperty.call(obj, target.path)) out.push(srcPath);
+      }
+    };
+
+    if (rl instanceof Map) {
+      for (const [srcPath, dests] of rl.entries()) {
+        if (typeof srcPath !== "string") continue;
+        addIfLinksTo(srcPath, dests);
+      }
+      return out;
+    }
+
+    if (typeof rl === "object") {
+      for (const [srcPath, dests] of Object.entries(rl as Record<string, unknown>)) {
+        addIfLinksTo(srcPath, dests);
+      }
+    }
+
+    return out;
+  }
+  
+  private getBacklinkSourcePaths(target: TFile): string[] {
+    return this.backlinkPathsFromResolvedLinks(target);
+  }
 
   private buildTagIndex(): Map<string, TFile[]> {
     const index = new Map<string, TFile[]>();
@@ -6562,6 +6655,9 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
     const radiusPx = this.pingToPixels(radius, unit, customUnitId);
     if (radiusPx == null) return;
+	
+    const preset = ping.pingPresetId ? this.findPingPresetById(ping.pingPresetId) : undefined;
+    const allowedLayerIds = this.resolvePingSearchLayerIds(ping, preset);
 
     const inRangePaths = new Set<string>();
     const distances: Record<string, number> = {};
@@ -6572,6 +6668,7 @@ if (this.plugin.settings.enableTextLayers && this.data) {
       if (m.id === ping.id) continue;
       if (m.anchorSpace === "viewport") continue;
       if (m.type === "ping") continue;
+	  if (allowedLayerIds && !allowedLayerIds.has(m.layer)) continue;
 
       const dx = (m.x - ping.x) * this.imgW;
       const dy = (m.y - ping.y) * this.imgH;
@@ -6650,13 +6747,9 @@ if (this.plugin.settings.enableTextLayers && this.data) {
         ? ["*(none)*"]
         : tooltipsSorted.map(([txt, d]) => `- ${txt} (${d} ${unitLabel})`);
 
-	// --- Related notes by tags (per in-range note that matches the preset filters) ---
-    const preset = ping.pingPresetId ? this.findPingPresetById(ping.pingPresetId) : undefined;
-    const excludeTagNorms = new Set(
-      (preset?.filterTags ?? [])
-        .map((t) => this.normalizeTagForIndex(t))
-        .filter(Boolean),
-    );
+    const relatedMode = preset?.relatedLookup ?? "tags";
+	
+	let relatedBody = "";
 
     const inRangeFiles = listSorted
       .map((p) => this.app.vault.getAbstractFileByPath(p))
@@ -6665,47 +6758,104 @@ if (this.plugin.settings.enableTextLayers && this.data) {
       .filter(({ file }) => this.fileMatchesPartyFilters(file, preset))
       .sort((a, b) => a.dist - b.dist || a.file.path.localeCompare(b.file.path));
 
-    const candidates = inRangeFiles.map(({ file, dist }) => {
-      const tags = this.collectTagsForFile(file);
-      for (const ex of excludeTagNorms) tags.delete(ex);
+    try {
+      if (relatedMode === "off") {
+        relatedBody = "*(disabled)*";
+      } else if (relatedMode === "backlinks") {
+        const maxPerNote = 50;
+        const blocks: string[] = [];
 
-      const norms = [...tags.keys()].sort((aa, bb) => {
-        const aTag = tags.get(aa) ?? aa;
-        const bTag = tags.get(bb) ?? bb;
-        return aTag.localeCompare(bTag, undefined, { sensitivity: "base" });
-      });
+        if (inRangeFiles.length === 0) {
+          relatedBody = "*(none)*";
+        } else {
+          for (const c of inRangeFiles) {
+            const pinLabel = `${this.formatWikiLink(c.file, af.path)} (${c.dist} ${unitLabel})`;
+            const lines: string[] = [];
+            lines.push(`| ${pinLabel} | Backlinks |`);
+            lines.push("| --- | --- |");
 
-      return { file, dist, tags, norms };
-    }).filter((c) => c.norms.length > 0);
+            const sourcePaths = this.getBacklinkSourcePaths(c.file);
+            const sources = sourcePaths
+              .map((p) => this.app.vault.getAbstractFileByPath(p))
+              .filter((x): x is TFile => x instanceof TFile)
+              .filter((f) => f.path !== c.file.path && f.path !== af.path)
+              .sort((a, b) => a.basename.localeCompare(b.basename, undefined, { sensitivity: "base" }));
 
-    let relatedBody = "";
-    if (candidates.length > 0) {
-      const tagIndex = this.buildTagIndex();
-      const tables: string[] = [];
+            const slice = sources.slice(0, maxPerNote);
+            const rest = sources.length - slice.length;
+            const links = slice.map((f) => this.formatWikiLink(f, af.path));
+            const cell = links.length ? links.join("<br>") + (rest > 0 ? `<br>… +${rest} more` : "") : "*(none)*";
+            lines.push(`| Backlinks | ${cell} |`);
 
-      for (const c of candidates) {
-        const pinLabel = `${this.formatWikiLink(c.file, af.path)} (${c.dist} ${unitLabel})`;
+            blocks.push(lines.join("\n"));
+          }
 
-        const lines: string[] = [];
-        lines.push(`| ${pinLabel} | Notes with tag |`);
-        lines.push("| --- | --- |");
-
-        for (const norm of c.norms) {
-          const displayTag = c.tags.get(norm) ?? `#${norm}`;
-
-          const matches = (tagIndex.get(norm) ?? [])
-            .filter((f) => f.path !== c.file.path && f.path !== af.path)
-            .sort((a, b) => a.basename.localeCompare(b.basename, undefined, { sensitivity: "base" }));
-
-          const links = matches.map((f) => this.formatWikiLink(f, af.path));
-          const cell = links.length ? links.join("<br>") : "*(none)*";
-          lines.push(`| ${this.escapeTableCell(displayTag)} | ${cell} |`);
+          relatedBody = blocks.join("\n\n").trim() || "*(none)*";
         }
+      } else {
+        const excludeTagNorms = new Set(
+          (preset?.filterTags ?? [])
+            .map((t) => this.normalizeTagForIndex(t))
+            .filter(Boolean),
+        );
 
-        tables.push(lines.join("\n"));
+        const candidates = inRangeFiles.map(({ file, dist }) => {
+          const tags = this.collectTagsForFile(file);
+          for (const ex of excludeTagNorms) tags.delete(ex);
+
+          const norms = [...tags.keys()].sort((aa, bb) => {
+            const aTag = tags.get(aa) ?? aa;
+            const bTag = tags.get(bb) ?? bb;
+            return aTag.localeCompare(bTag, undefined, { sensitivity: "base" });
+          });
+
+          return { file, dist, tags, norms };
+        }).filter((c) => c.norms.length > 0);
+
+        if (candidates.length === 0) {
+          relatedBody = "*(none)*";
+        } else {
+          const wantNorms = new Set<string>();
+          for (const c of candidates) for (const n of c.norms) wantNorms.add(n);
+          const tagIndex = this.buildTagIndexForTags(wantNorms);
+
+          const maxPerTag = 50;
+          const tables: string[] = [];
+
+          for (const c of candidates) {
+            const pinLabel = `${this.formatWikiLink(c.file, af.path)} (${c.dist} ${unitLabel})`;
+
+            const lines: string[] = [];
+            lines.push(`| ${pinLabel} | Notes with tag |`);
+            lines.push("| --- | --- |");
+
+            for (const norm of c.norms) {
+              const displayTag = c.tags.get(norm) ?? `#${norm}`;
+
+              const matches = (tagIndex.get(norm) ?? [])
+                .filter((f) => f.path !== c.file.path && f.path !== af.path)
+                .sort((a, b) => a.basename.localeCompare(b.basename, undefined, { sensitivity: "base" }));
+
+              const slice = matches.slice(0, maxPerTag);
+              const rest = matches.length - slice.length;
+              const links = slice.map((f) => this.formatWikiLink(f, af.path));
+              const cell = links.length ? links.join("<br>") + (rest > 0 ? `<br>… +${rest} more` : "") : "*(none)*";
+              lines.push(`| ${this.escapeTableCell(displayTag)} | ${cell} |`);
+            }
+
+            tables.push(lines.join("\n"));
+          }
+
+          relatedBody = tables.join("\n\n").trim() || "*(none)*";
+        }
       }
-
-      relatedBody = tables.join("\n\n").trim();
+    } catch (e: unknown) {
+      console.warn("Zoom Map: related section build failed", e);
+      relatedBody = "*(error building related section)*";
+    }
+	
+    if (!relatedBody.trim()) {
+      relatedBody = "*(none)*";
     }
 
     // Rebuild note body into the canonical layout and update both sections in one pass.
