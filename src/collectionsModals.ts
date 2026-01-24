@@ -881,21 +881,37 @@ class PingPresetEditorModal extends Modal {
 
     new Setting(contentEl)
       .setName("Filter properties (optional)")
-      .setDesc('One per line: key=value. Example: type=npc')
+      .setDesc('One line per key=value, multiple values with | or ,')
       .addTextArea((a) => {
         const props = this.working.filterProps ?? {};
-        a.setValue(Object.entries(props).map(([k, v]) => `${k}=${v}`).join("\n"));
+        a.setValue(
+          Object.entries(props)
+            .map(([k, v]) => {
+              const vals = Array.isArray(v) ? v : [String(v ?? "")];
+              const cleaned = vals.map((s) => String(s).trim()).filter(Boolean);
+              return cleaned.length > 1 ? `${k}=${cleaned.join(" | ")}` : `${k}=${cleaned[0] ?? ""}`;
+            })
+            .filter((ln) => ln.trim().length > 0)
+            .join("\n"),
+        );
         a.onChange((v) => {
-          const next: Record<string, string> = {};
+		  const next: Record<string, string | string[]> = {};
           for (const line of v.split("\n")) {
             const s = line.trim();
             if (!s) continue;
             const i = s.indexOf("=");
             if (i < 1) continue;
             const k = s.slice(0, i).trim();
-            const val = s.slice(i + 1).trim();
-            if (!k || !val) continue;
-            next[k] = val;
+            const raw = s.slice(i + 1).trim();
+            if (!k || !raw) continue;
+
+            const vals = raw
+              .split(/[|,]/g)
+              .map((x) => x.trim())
+              .filter(Boolean);
+
+            if (vals.length === 1) next[k] = vals[0];
+            else if (vals.length > 1) next[k] = vals;
           }
           this.working.filterProps = next;
         });

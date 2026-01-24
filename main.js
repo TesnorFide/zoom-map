@@ -2783,10 +2783,17 @@ var PingPresetEditorModal = class extends import_obsidian11.Modal {
         this.working.filterTags = tags;
       });
     });
-    new import_obsidian11.Setting(contentEl).setName("Filter properties (optional)").setDesc("One per line: key=value. Example: type=npc").addTextArea((a) => {
+    new import_obsidian11.Setting(contentEl).setName("Filter properties (optional)").setDesc("One line per key=value, multiple values with | or ,").addTextArea((a) => {
       var _a2;
       const props = (_a2 = this.working.filterProps) != null ? _a2 : {};
-      a.setValue(Object.entries(props).map(([k, v]) => `${k}=${v}`).join("\n"));
+      a.setValue(
+        Object.entries(props).map(([k, v]) => {
+          var _a3;
+          const vals = Array.isArray(v) ? v : [String(v != null ? v : "")];
+          const cleaned = vals.map((s) => String(s).trim()).filter(Boolean);
+          return cleaned.length > 1 ? `${k}=${cleaned.join(" | ")}` : `${k}=${(_a3 = cleaned[0]) != null ? _a3 : ""}`;
+        }).filter((ln) => ln.trim().length > 0).join("\n")
+      );
       a.onChange((v) => {
         const next = {};
         for (const line of v.split("\n")) {
@@ -2795,9 +2802,11 @@ var PingPresetEditorModal = class extends import_obsidian11.Modal {
           const i = s.indexOf("=");
           if (i < 1) continue;
           const k = s.slice(0, i).trim();
-          const val = s.slice(i + 1).trim();
-          if (!k || !val) continue;
-          next[k] = val;
+          const raw = s.slice(i + 1).trim();
+          if (!k || !raw) continue;
+          const vals = raw.split(/[|,]/g).map((x) => x.trim()).filter(Boolean);
+          if (vals.length === 1) next[k] = vals[0];
+          else if (vals.length > 1) next[k] = vals;
         }
         this.working.filterProps = next;
       });
@@ -8413,13 +8422,20 @@ var MapInstance = class extends import_obsidian16.Component {
         if (typeof x === "number" || typeof x === "boolean") return String(x).trim() === want;
         return false;
       };
-      const clauses = Object.entries(props).map(([k, v]) => ({ key: (k != null ? k : "").trim(), want: (v != null ? v : "").trim() })).filter((c) => c.key.length > 0 && c.want.length > 0);
+      const clauses = Object.entries(props).flatMap(([kRaw, vRaw]) => {
+        const key = (kRaw != null ? kRaw : "").trim();
+        if (!key) return [];
+        const wants = (Array.isArray(vRaw) ? vRaw.join(" | ") : String(vRaw != null ? vRaw : "")).split(/[|,]/g).map((s) => s.trim()).filter(Boolean);
+        if (wants.length === 0) return [];
+        return [{ key, wants }];
+      });
       if (clauses.length) {
-        const matchesAny = clauses.some(({ key, want }) => {
+        const matchesAny = clauses.some(({ key, wants }) => {
           const have = fm[key];
           if (have == null) return false;
-          if (Array.isArray(have)) return have.some((x) => matchScalar(x, want));
-          return matchScalar(have, want);
+          const matchesWants = (x) => wants.some((w) => matchScalar(x, w));
+          if (Array.isArray(have)) return have.some((x) => matchesWants(x));
+          return matchesWants(have);
         });
         if (!matchesAny) return false;
       }
@@ -8620,13 +8636,16 @@ ${after}`;
     const propClauses = [];
     for (const [kRaw, vRaw] of Object.entries(props)) {
       const k = (kRaw != null ? kRaw : "").trim();
-      const v = (vRaw != null ? vRaw : "").trim();
-      if (!k || !v) continue;
-      propClauses.push(`note["${k.replace(/"/g, '\\"')}"] == "${v.replace(/"/g, '\\"')}"`);
+      if (!k) continue;
+      const wants = (Array.isArray(vRaw) ? vRaw.join(" | ") : String(vRaw != null ? vRaw : "")).split(/[|,]/g).map((s) => s.trim()).filter(Boolean);
+      if (wants.length === 0) continue;
+      for (const v of wants) {
+        propClauses.push(
+          `note["${k.replace(/"/g, '\\"')}"] == "${v.replace(/"/g, '\\"')}"`
+        );
+      }
     }
-    if (propClauses.length) {
-      andFilters.push({ or: propClauses });
-    }
+    if (propClauses.length) andFilters.push({ or: propClauses });
     const baseObj = {
       filters: { and: andFilters },
       formulas: {

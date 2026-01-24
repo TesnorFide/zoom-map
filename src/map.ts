@@ -62,9 +62,8 @@ export interface PingPreset {
   // ping note creation
   noteFolder?: string; // vault folder path, e.g. "Pings/MyMap"
 
-  // optional extra filters for the embedded Bases view
-  filterTags?: string[];                 // OR tags; e.g. ["npc","shop"]
-  filterProps?: Record<string, string>;  // AND props; e.g. { type: "npc" }
+  filterTags?: string[];
+  filterProps?: Record<string, string | string[]>;
 
   // Related notes section: how to expand search starting from in-range notes
   relatedLookup?: "off" | "tags" | "backlinks";
@@ -6278,15 +6277,28 @@ if (this.plugin.settings.enableTextLayers && this.data) {
       };
 
       const clauses = Object.entries(props)
-        .map(([k, v]) => ({ key: (k ?? "").trim(), want: (v ?? "").trim() }))
-        .filter((c) => c.key.length > 0 && c.want.length > 0);
+        .flatMap(([kRaw, vRaw]) => {
+          const key = (kRaw ?? "").trim();
+          if (!key) return [];
+
+          const wants = (Array.isArray(vRaw) ? vRaw.join(" | ") : String(vRaw ?? ""))
+            .split(/[|,]/g)
+            .map((s) => s.trim())
+            .filter(Boolean);
+
+          if (wants.length === 0) return [];
+          return [{ key, wants }];
+        });
 
       if (clauses.length) {
-        const matchesAny = clauses.some(({ key, want }) => {
+        const matchesAny = clauses.some(({ key, wants }) => {
           const have = fm[key];
           if (have == null) return false;
-          if (Array.isArray(have)) return have.some((x) => matchScalar(x, want));
-          return matchScalar(have, want);
+
+          const matchesWants = (x: unknown) => wants.some((w) => matchScalar(x, w));
+
+          if (Array.isArray(have)) return have.some((x) => matchesWants(x));
+          return matchesWants(have);
         });
 
         if (!matchesAny) return false;
@@ -6510,16 +6522,24 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     }
 
     const props = preset.filterProps ?? {};
-	const propClauses: string[] = [];
+    const propClauses: string[] = [];
     for (const [kRaw, vRaw] of Object.entries(props)) {
       const k = (kRaw ?? "").trim();
-      const v = (vRaw ?? "").trim();
-      if (!k || !v) continue;
-      propClauses.push(`note["${k.replace(/"/g, '\\"')}"] == "${v.replace(/"/g, '\\"')}"`);
+      if (!k) continue;
+
+      const wants = (Array.isArray(vRaw) ? vRaw.join(" | ") : String(vRaw ?? ""))
+        .split(/[|,]/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (wants.length === 0) continue;
+
+      for (const v of wants) {
+        propClauses.push(
+          `note["${k.replace(/"/g, '\\"')}"] == "${v.replace(/"/g, '\\"')}"`,
+        );
+      }
     }
-    if (propClauses.length) {
-      andFilters.push({ or: propClauses });
-    }
+    if (propClauses.length) andFilters.push({ or: propClauses });
 
     const baseObj: Record<string, unknown> = {
       filters: { and: andFilters },
