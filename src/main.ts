@@ -60,6 +60,7 @@ interface LibraryFileData {
   version: 1;
   icons: IconProfile[];
   baseCollections: BaseCollection[];
+  travelRulesPacks?: TravelRulesPack[];
   exportedAt?: string;
 }
 
@@ -844,6 +845,7 @@ export default class ZoomMapPlugin extends Plugin {
       version: 1,
       icons: this.settings.icons ?? [],
       baseCollections: this.settings.baseCollections ?? [],
+	  travelRulesPacks: this.settings.travelRulesPacks ?? [],
       exportedAt: new Date().toISOString(),
     };
 

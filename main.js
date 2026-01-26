@@ -13027,13 +13027,14 @@ var ZoomMapPlugin = class extends import_obsidian22.Plugin {
     }
   }
   async saveLibraryToPath(path) {
-    var _a, _b;
+    var _a, _b, _c;
     const p = (0, import_obsidian22.normalizePath)(path);
     const ext = this.settings;
     const payload = {
       version: 1,
       icons: (_a = this.settings.icons) != null ? _a : [],
       baseCollections: (_b = this.settings.baseCollections) != null ? _b : [],
+      travelRulesPacks: (_c = this.settings.travelRulesPacks) != null ? _c : [],
       exportedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
     try {
