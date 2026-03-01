@@ -23,16 +23,54 @@ function tintSvgMarkup(svg: string, color: string): string {
   const c = color.trim();
   if (!c) return svg;
 
-  let s = svg;
+  try {
+    const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+    const root = doc.querySelector("svg");
+    if (!root) return svg;
 
-  s = s.replace(/fill="[^"]*"/gi, `fill="${c}"`);
-  s = s.replace(/stroke="[^"]*"/gi, `stroke="${c}"`);
+    const inner = root.querySelector("#zm-inner") ?? root;
+    const base = root.querySelector("#zm-base");
+    const outline = root.querySelector("#zm-outline");
 
-  if (!/fill="/i.test(s)) {
-    s = s.replace(/<svg([^>]*?)>/i, `<svg$1 fill="${c}">`);
+    const shapes = inner.querySelectorAll<SVGElement>("path, circle, rect, polygon, polyline, line, ellipse");
+    let touched = false;
+
+    shapes.forEach((el) => {
+      if (base && base.contains(el)) return;
+      if (outline && outline.contains(el)) return;
+
+      const styleFill = (el as unknown as { style?: CSSStyleDeclaration }).style?.fill;
+      const styleStroke = (el as unknown as { style?: CSSStyleDeclaration }).style?.stroke;
+      const fillAttr = el.getAttribute("fill");
+      const strokeAttr = el.getAttribute("stroke");
+
+      const hasFill =
+        (typeof styleFill === "string" && styleFill && styleFill.toLowerCase() !== "none") ||
+        (typeof fillAttr === "string" && fillAttr && fillAttr.toLowerCase() !== "none");
+      const hasStroke =
+        (typeof styleStroke === "string" && styleStroke && styleStroke.toLowerCase() !== "none") ||
+        (typeof strokeAttr === "string" && strokeAttr && strokeAttr.toLowerCase() !== "none");
+
+      if (hasFill) {
+        (el as unknown as { style: CSSStyleDeclaration }).style.fill = c;
+        el.setAttribute("fill", c);
+        touched = true;
+      }
+      if (hasStroke) {
+        (el as unknown as { style: CSSStyleDeclaration }).style.stroke = c;
+        el.setAttribute("stroke", c);
+        touched = true;
+      }
+    });
+
+    if (!touched) {
+      (inner as SVGElement).setAttribute("fill", c);
+    }
+
+    return new XMLSerializer().serializeToString(root);
+  } catch {
+    return svg;
   }
-
-  return s;
 }
 
 export class MarkerEditorModal extends Modal {
@@ -388,6 +426,87 @@ export class MarkerEditorModal extends Modal {
           }
         });
       });
+	  
+      // Always-visible tooltip label (pin caption)
+      let labelPosSetting: Setting | null = null;
+      let labelOffsetXSetting: Setting | null = null;
+      let labelOffsetYSetting: Setting | null = null;
+
+      const toggleLabelExtras = () => {
+        const on = !!this.marker.tooltipLabelAlways;
+        labelPosSetting?.settingEl.toggle(on);
+        labelOffsetXSetting?.settingEl.toggle(on);
+        labelOffsetYSetting?.settingEl.toggle(on);
+      };
+      new Setting(contentEl)
+        .setName("Tooltip label always visible")
+        .setDesc("Renders the tooltip text as a label on the map (useful for village names).")
+        .addToggle((tg) => {
+          tg.setValue(!!this.marker.tooltipLabelAlways).onChange((on) => {
+            if (on) {
+              this.marker.tooltipLabelAlways = true;
+              if (!this.marker.tooltipLabelPosition) this.marker.tooltipLabelPosition = "below";
+            } else {
+              delete this.marker.tooltipLabelAlways;
+            }
+            toggleLabelExtras();
+          });
+        });
+
+      labelPosSetting = new Setting(contentEl)
+        .setName("Tooltip label position")
+        .setDesc("Where to place the always-visible label relative to the pin anchor.")
+        .addDropdown((d) => {
+          d.addOption("below", "Below pin");
+          d.addOption("above", "Above pin");
+          d.setValue(this.marker.tooltipLabelPosition ?? "below");
+          d.onChange((v) => {
+            this.marker.tooltipLabelPosition = (v === "above" ? "above" : "below");
+          });
+        });
+      // Offsets (px)
+      labelOffsetXSetting = new Setting(contentEl)
+        .setName("Label offset X (px)")
+        .addText((t) => {
+          t.inputEl.type = "number";
+          t.setPlaceholder("0");
+          t.setValue(
+            typeof this.marker.tooltipLabelOffsetX === "number"
+              ? String(this.marker.tooltipLabelOffsetX)
+              : "0",
+          );
+          t.onChange((v) => {
+            const n = Number(String(v).replace(",", "."));
+            if (!Number.isFinite(n)) {
+              delete this.marker.tooltipLabelOffsetX;
+              return;
+            }
+            this.marker.tooltipLabelOffsetX = n;
+          });
+        });
+
+      labelOffsetYSetting = new Setting(contentEl)
+        .setName("Label offset y (px)")
+        .setDesc("Positive moves the label down, negative moves it up.")
+        .addText((t) => {
+          t.inputEl.type = "number";
+          t.setPlaceholder("0");
+          t.setValue(
+            typeof this.marker.tooltipLabelOffsetY === "number"
+              ? String(this.marker.tooltipLabelOffsetY)
+              : "0",
+          );
+          t.onChange((v) => {
+            const n = Number(String(v).replace(",", "."));
+            if (!Number.isFinite(n)) {
+              delete this.marker.tooltipLabelOffsetY;
+              return;
+            }
+            this.marker.tooltipLabelOffsetY = n;
+          });
+        });
+
+      toggleLabelExtras();
 
       new Setting(contentEl).setName("Tooltip").addTextArea((a) => {
         a.setPlaceholder("Optional tooltip text");
@@ -682,6 +801,21 @@ export class MarkerEditorModal extends Modal {
 	    if (!this.marker.scaleLikeSticker) delete this.marker.scaleLikeSticker;
 	    if (!this.marker.iconColor) delete this.marker.iconColor;
 	    if (!this.marker.tooltipAlwaysOn) delete this.marker.tooltipAlwaysOn;
+        if (!this.marker.tooltipLabelAlways) delete this.marker.tooltipLabelAlways;
+        if (this.marker.tooltipLabelAlways && !this.marker.tooltipLabelPosition) this.marker.tooltipLabelPosition = "below";
+        if (!this.marker.tooltipLabelAlways) delete this.marker.tooltipLabelPosition;
+		
+        const normOffset = (x: unknown): number | undefined => {
+          if (typeof x !== "number" || !Number.isFinite(x)) return undefined;
+          if (Math.abs(x) < 1e-9) return undefined;
+          return x;
+        };
+        const ox = normOffset(this.marker.tooltipLabelOffsetX);
+        const oy = normOffset(this.marker.tooltipLabelOffsetY);
+        if (ox === undefined) delete this.marker.tooltipLabelOffsetX;
+        else this.marker.tooltipLabelOffsetX = ox;
+        if (oy === undefined) delete this.marker.tooltipLabelOffsetY;
+        else this.marker.tooltipLabelOffsetY = oy;
 	  }
 	  
       if (this.marker.type === "swap") {

@@ -945,6 +945,29 @@ body.zm-cursor-resize-nesw {
   cursor: nesw-resize;
 }
 
+/* Always-visible marker label (tooltip caption) */
+.zm-marker-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  pointer-events: none;
+  z-index: 25;
+
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: var(--shadow-s);
+}
+
 /* Font Awesome picker (settings) */
 .zoommap-fa-picker {
   display: flex;

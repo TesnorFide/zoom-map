@@ -353,16 +353,55 @@ function tintSvgMarkupLocal(svg: string, color: string): string {
   const c = color.trim();
   if (!c) return svg;
 
-  let s = svg;
+  try {
+    const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+    const root = doc.querySelector("svg");
+    if (!root) return svg;
 
-  s = s.replace(/fill="[^"]*"/gi, `fill="${c}"`);
-  s = s.replace(/stroke="[^"]*"/gi, `stroke="${c}"`);
+    const inner = root.querySelector("#zm-inner") ?? root;
+    const base = root.querySelector("#zm-base");
+    const outline = root.querySelector("#zm-outline");
 
-  if (!/fill="/i.test(s)) {
-    s = s.replace(/<svg([^>]*?)>/i, `<svg$1 fill="${c}">`);
+    const shapes = inner.querySelectorAll<SVGElement>("path, circle, rect, polygon, polyline, line, ellipse");
+    let touched = false;
+
+    shapes.forEach((el) => {
+      if (base && base.contains(el)) return;
+      if (outline && outline.contains(el)) return;
+
+      const styleFill = (el as unknown as { style?: CSSStyleDeclaration }).style?.fill;
+      const styleStroke = (el as unknown as { style?: CSSStyleDeclaration }).style?.stroke;
+
+      const fillAttr = el.getAttribute("fill");
+      const strokeAttr = el.getAttribute("stroke");
+
+      const hasFill =
+        (typeof styleFill === "string" && styleFill && styleFill.toLowerCase() !== "none") ||
+        (typeof fillAttr === "string" && fillAttr && fillAttr.toLowerCase() !== "none");
+      const hasStroke =
+        (typeof styleStroke === "string" && styleStroke && styleStroke.toLowerCase() !== "none") ||
+        (typeof strokeAttr === "string" && strokeAttr && strokeAttr.toLowerCase() !== "none");
+
+      if (hasFill) {
+        (el as unknown as { style: CSSStyleDeclaration }).style.fill = c;
+        el.setAttribute("fill", c);
+        touched = true;
+      }
+      if (hasStroke) {
+        (el as unknown as { style: CSSStyleDeclaration }).style.stroke = c;
+        el.setAttribute("stroke", c);
+        touched = true;
+      }
+    });
+
+    if (!touched) {
+      (inner as SVGElement).setAttribute("fill", c);
+    }
+
+    return new XMLSerializer().serializeToString(root);
+  } catch {
+    return svg;
   }
-
-  return s;
 }
 
 /* Per-marker option accessors (typed; avoid any) */
@@ -539,6 +578,22 @@ export class MapInstance extends Component {
   private userResizing = false;
 
   private yamlAppliedOnce = false;
+  
+  private ensureMarkerLayersByNames(names: string[] | undefined): void {
+    if (!this.data) return;
+    const list = (names ?? []).map((s) => (s ?? "").trim()).filter(Boolean);
+    if (list.length === 0) return;
+
+    this.data.layers ??= [{ id: "default", name: "Default", visible: true, locked: false }];
+
+    const existingByName = new Set(this.data.layers.map((l) => (l.name ?? "").trim()));
+    for (const name of list) {
+      if (existingByName.has(name)) continue;
+      const id = generateId("layer");
+      this.data.layers.push({ id, name, visible: true, locked: false });
+      existingByName.add(name);
+    }
+  }
   
   private stripYamlScalar(s: string): string {
     const t = s.trim();
@@ -1158,6 +1213,14 @@ export class MapInstance extends Component {
     if (!didChange) {
       new Notice("No changes to apply.", 2000);
       return;
+    }
+	
+    try {
+      this.ensureMarkerLayersByNames(cfg.markerLayers);
+      await this.saveDataSoon();
+      this.renderMarkersOnly();
+    } catch (e) {
+      console.warn("Failed to apply markerLayers to marker store", e);
     }
     new Notice("View updated.", 2500);
   }
@@ -2303,6 +2366,8 @@ export class MapInstance extends Component {
 
     const layers = this.data.textLayers ?? [];
     for (const layer of layers) {
+      const activeBase = this.getActiveBasePath();
+      if (layer.boundBase && layer.boundBase !== activeBase) continue;
       layer.style = this.normalizeTextLayerStyle(layer.style);
 
       // Hitbox for selecting / editing
@@ -2428,6 +2493,7 @@ export class MapInstance extends Component {
 
       const rect = document.createElementNS(ns, "rect");
       rect.classList.add("zm-text-guide-rect");
+	  rect.classList.add("zm-text-guide--active");
       rect.setAttribute("x", String(x));
       rect.setAttribute("y", String(y));
       rect.setAttribute("width", String(w));
@@ -3865,6 +3931,14 @@ export class MapInstance extends Component {
 
   private onPointerMove(e: PointerEvent): void {
     if (!this.ready) return;
+
+    // Prevent workspace edge-swipe gestures while actively panning/zooming on touch devices.
+    if (e.pointerType === "touch") {
+      if (this.draggingView || this.pinchActive) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }
 	
 	// Text layer draw preview (box)
     if (this.textMode === "draw-layer" && this.textDrawStart) {
@@ -4304,16 +4378,23 @@ this.viewDragDist = 0;
     if (!this.data) return;
     const active = this.getActiveBasePath();
     let changed = false;
+    // Marker layers
     for (const l of this.data.layers) {
       if (!l.boundBase) continue;
       const want = l.boundBase === active;
-      if (l.visible !== want) {
-        l.visible = want;
-        changed = true;
-      }
+      if (l.visible !== want) { l.visible = want; changed = true; }
+    }
+
+    // Draw layers
+    for (const dl of (this.data.drawLayers ?? [])) {
+      if (!dl.boundBase) continue;
+      const want = dl.boundBase === active;
+      if (dl.visible !== want) { dl.visible = want; changed = true; }
     }
     if (changed) {
       this.renderMarkersOnly();
+      this.renderDrawings();
+      this.renderTextLayers()
       await this.saveDataSoon();
     }
   }
@@ -4946,9 +5027,44 @@ private onContextMenuViewport(e: MouseEvent): void {
         if (chk) chk.textContent = dl.visible ? "✓" : "";
       },
     }));
+	
+     const bindDrawLayerSubmenus: ZMMenuItem[] = drawLayers.map((dl) => {
+      const suffix = dl.boundBase ? ` → ${labelForBase(dl.boundBase)}` : " → None";
+      return {
+        label: `Bind "${dl.name}" to base${suffix}`,
+        children: [
+          {
+            label: "None",
+            checked: !dl.boundBase,
+            action: (rowEl) => {
+              dl.boundBase = undefined;
+              void this.saveDataSoon();
+              const menu = rowEl.parentElement;
+              menu?.querySelectorAll<HTMLElement>(".zm-menu__check").forEach((c) => (c.textContent = ""));
+              rowEl.querySelector<HTMLElement>(".zm-menu__check")!.textContent = "✓";
+            },
+          },
+          { type: "separator" },
+          ...bases.map<ZMMenuItem>((b) => ({
+            label: b.name ?? basename(b.path),
+            checked: dl.boundBase === b.path,
+            action: (rowEl) => {
+              dl.boundBase = b.path;
+              void this.applyBoundBaseVisibility();
+              void this.saveDataSoon();
+              const menu = rowEl.parentElement;
+              menu?.querySelectorAll<HTMLElement>(".zm-menu__check").forEach((c) => (c.textContent = ""));
+              rowEl.querySelector<HTMLElement>(".zm-menu__check")!.textContent = "✓";
+            },
+          })),
+        ],
+      };
+    });
 
     if (this.plugin.settings.enableDrawing) {
       drawLayerChildren.push(
+        { type: "separator" },
+        { label: "Bind draw layer to base", children: bindDrawLayerSubmenus },
         { type: "separator" },
         {
           label: "Rename draw layer…",
@@ -5378,6 +5494,38 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
           this.closeMenu();
         },
+      },
+      { type: "separator" },
+      {
+        label: `Bind to base${tl.boundBase ? ` → ${labelForBase(tl.boundBase)}` : " → None"}`,
+        children: [
+          {
+            label: "None",
+            checked: !tl.boundBase,
+            action: (rowEl) => {
+              tl.boundBase = undefined;
+              void this.saveDataSoon();
+              this.renderTextLayers();
+              const menu = rowEl.parentElement;
+              menu?.querySelectorAll<HTMLElement>(".zm-menu__check").forEach((c) => (c.textContent = ""));
+              rowEl.querySelector<HTMLElement>(".zm-menu__check")!.textContent = "✓";
+            },
+          },
+          { type: "separator" },
+          ...bases.map<ZMMenuItem>((b) => ({
+            label: b.name ?? basename(b.path),
+            checked: tl.boundBase === b.path,
+            action: (rowEl) => {
+              tl.boundBase = b.path;
+              void this.applyBoundBaseVisibility();
+              void this.saveDataSoon();
+              this.renderTextLayers();
+              const menu = rowEl.parentElement;
+              menu?.querySelectorAll<HTMLElement>(".zm-menu__check").forEach((c) => (c.textContent = ""));
+              rowEl.querySelector<HTMLElement>(".zm-menu__check")!.textContent = "✓";
+            },
+          })),
+        ],
       },
     ],
   }));
@@ -5899,8 +6047,17 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 
   private updateMarkerInvScaleOnly(): void {
     const invScale = this.cfg.responsive ? 1 : (1 / this.scale);
-    const invs = this.markersEl.querySelectorAll<HTMLDivElement>(".zm-marker-inv");
-    invs.forEach((el) => { el.style.transform = `scale(${invScale})`; });
+
+    const updateContainer = (root: HTMLElement | null) => {
+      if (!root) return;
+      const invs = root.querySelectorAll<HTMLDivElement>(".zm-marker-inv");
+      invs.forEach((el) => {
+        el.style.transform = `scale(${invScale})`;
+      });
+    };
+
+    updateContainer(this.markersEl);
+    updateContainer(this.hudMarkersEl);
   }
 
  private updateMarkerZoomVisibilityOnly(): void {
@@ -7066,8 +7223,20 @@ if (this.plugin.settings.enableTextLayers && this.data) {
     const usedKeys = new Set<string>();
     for (const m of this.data.markers) {
       if (m.type === "sticker") continue;
-      const key = m.iconKey ?? this.plugin.settings.defaultIconKey;
-      usedKeys.add(key);
+      if (m.type === "swap" && m.swapKey) {
+        const preset = this.findSwapPresetById(m.swapKey);
+        if (preset?.frames?.length) {
+          for (const fr of preset.frames) {
+            const k = (fr?.iconKey ?? "").trim();
+            if (k) usedKeys.add(k);
+          }
+        }
+        if (m.iconKey) usedKeys.add(m.iconKey);
+        continue;
+      }
+
+      const key = (m.iconKey ?? this.plugin.settings.defaultIconKey).trim();
+      if (key) usedKeys.add(key);
     }
 
     if (usedKeys.size === 0) {
@@ -7468,8 +7637,15 @@ if (this.plugin.settings.enableTextLayers && this.data) {
           tEl.setAttribute("text-anchor", "middle");
           tEl.setAttribute("dominant-baseline", "middle");
           tEl.setAttribute("fill", strokeColor);
-          if (Math.abs(polylineMid.angleDeg) > 0.01) {
-            tEl.setAttribute("transform", `rotate(${polylineMid.angleDeg} ${polylineMid.x} ${polylineMid.y})`);
+          let ang = polylineMid.angleDeg;
+          // Keep text upright (avoid upside-down labels)
+          if (ang > 90 || ang < -90) ang += 180;
+          // normalize into [-180, 180]
+          while (ang > 180) ang -= 360;
+          while (ang < -180) ang += 360;
+
+          if (Math.abs(ang) > 0.01) {
+            tEl.setAttribute("transform", `rotate(${ang} ${polylineMid.x} ${polylineMid.y})`);
           }
           tEl.textContent = txt;
           this.drawStaticLayer.appendChild(tEl);
@@ -8335,6 +8511,60 @@ if (this.plugin.settings.enableTextLayers && this.data) {
           anch.appendChild(icon);
         }
       }
+	  
+      // Always-visible tooltip label (caption)
+      if (
+        m.type !== "sticker" &&
+        !!m.tooltipLabelAlways &&
+        typeof m.tooltip === "string" &&
+        m.tooltip.trim().length > 0
+      ) {
+        const effectiveKey = (() => {
+          if (m.type === "swap") {
+            const fr = this.getSwapFrameForMarker(m);
+            if (fr?.iconKey) return fr.iconKey;
+          }
+          return m.iconKey ?? this.plugin.settings.defaultIconKey;
+        })();
+
+        const info = this.getIconInfo(effectiveKey);
+		const scaleLike = isScaleLikeSticker(m);
+        const pos = m.tooltipLabelPosition === "above" ? "above" : "below";
+        const gap = 6;
+        const offX =
+          typeof m.tooltipLabelOffsetX === "number" && Number.isFinite(m.tooltipLabelOffsetX) ? m.tooltipLabelOffsetX : 0;
+        const offY =
+          typeof m.tooltipLabelOffsetY === "number" && Number.isFinite(m.tooltipLabelOffsetY) ? m.tooltipLabelOffsetY : 0;
+
+        const xOff = ((info.size / 2) - info.anchorX) + offX;
+
+        // Place label above/below the icon bounds (relative to the anchor)
+        const yOffBase = pos === "above"
+          ? -(info.anchorY + gap)                 // icon top - gap
+          : (info.size - info.anchorY + gap);     // icon bottom + gap
+		const yOff = yOffBase + offY;
+
+        let parent: HTMLElement = host;
+        if (!isHud && !scaleLike) {
+          const invScale = this.cfg.responsive ? 1 : 1 / s;
+          let inv = host.querySelector<HTMLElement>(".zm-marker-inv");
+          if (!inv) {
+            inv = host.createDiv({ cls: "zm-marker-inv zm-marker-inv--label" });
+            inv.style.transform = `scale(${invScale})`;
+          }
+          parent = inv;
+        }
+
+        const label = parent.createDiv({ cls: "zm-marker-label" });
+        label.textContent = m.tooltip.trim();
+
+        // Position relative to the anchor (0,0), but shifted to icon center
+        label.style.left = `${xOff}px`;
+        label.style.top = `${yOff}px`;
+        label.style.transform = pos === "above"
+          ? "translate(-50%, -100%)"
+          : "translate(-50%, 0)";
+      }
 
       if (m.type !== "sticker") {
         host.addEventListener("mouseenter", (ev) =>
@@ -8502,6 +8732,16 @@ if (this.plugin.settings.enableTextLayers && this.data) {
                     this.renderMarkersOnly();
                   },
                 ).open();
+              },
+            },
+            {
+              label: "Pin sizes for this map…",
+              action: () => {
+                this.closeMenu();
+                const fr = this.getSwapFrameForMarker(m);
+                const key =
+                  (fr?.iconKey ?? m.iconKey ?? this.plugin.settings.defaultIconKey).trim();
+                this.openPinSizeEditor(key);
               },
             },
             {

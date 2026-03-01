@@ -1079,16 +1079,54 @@ function tintSvgMarkup(svg: string, color: string): string {
   const c = color.trim();
   if (!c) return svg;
 
-  let s = svg;
+  try {
+    const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+    const root = doc.querySelector("svg");
+    if (!root) return svg;
 
-  s = s.replace(/fill="[^"]*"/gi, `fill="${c}"`);
-  s = s.replace(/stroke="[^"]*"/gi, `stroke="${c}"`);
+    const inner = root.querySelector("#zm-inner") ?? root;
+    const base = root.querySelector("#zm-base");
+    const outline = root.querySelector("#zm-outline");
 
-  if (!/fill="/i.test(s)) {
-    s = s.replace(/<svg([^>]*?)>/i, `<svg$1 fill="${c}">`);
+    const shapes = inner.querySelectorAll<SVGElement>("path, circle, rect, polygon, polyline, line, ellipse");
+    let touched = false;
+
+    shapes.forEach((el) => {
+      if (base && base.contains(el)) return;
+      if (outline && outline.contains(el)) return;
+
+      const styleFill = (el as unknown as { style?: CSSStyleDeclaration }).style?.fill;
+      const styleStroke = (el as unknown as { style?: CSSStyleDeclaration }).style?.stroke;
+      const fillAttr = el.getAttribute("fill");
+      const strokeAttr = el.getAttribute("stroke");
+
+      const hasFill =
+        (typeof styleFill === "string" && styleFill && styleFill.toLowerCase() !== "none") ||
+        (typeof fillAttr === "string" && fillAttr && fillAttr.toLowerCase() !== "none");
+      const hasStroke =
+        (typeof styleStroke === "string" && styleStroke && styleStroke.toLowerCase() !== "none") ||
+        (typeof strokeAttr === "string" && strokeAttr && strokeAttr.toLowerCase() !== "none");
+
+      if (hasFill) {
+        (el as unknown as { style: CSSStyleDeclaration }).style.fill = c;
+        el.setAttribute("fill", c);
+        touched = true;
+      }
+      if (hasStroke) {
+        (el as unknown as { style: CSSStyleDeclaration }).style.stroke = c;
+        el.setAttribute("stroke", c);
+        touched = true;
+      }
+    });
+
+    if (!touched) {
+      (inner as SVGElement).setAttribute("fill", c);
+    }
+
+    return new XMLSerializer().serializeToString(root);
+  } catch {
+    return svg;
   }
-
-  return s;
 }
 
 /* ---------------- Settings Tab ---------------- */

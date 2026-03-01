@@ -95,6 +95,7 @@ export interface TextLayer {
   id: string;
   name: string;
   locked: boolean;
+  boundBase?: string;
 
   rect: { x0: number; y0: number; x1: number; y1: number };
   lines: TextBaseline[];
@@ -130,6 +131,12 @@ export interface Marker {
   iconColor?: string; // per-pin SVG color override
   tooltip?: string;
   tooltipAlwaysOn?: boolean;
+  
+  tooltipLabelAlways?: boolean;
+  tooltipLabelPosition?: "below" | "above";
+  
+  tooltipLabelOffsetX?: number;
+  tooltipLabelOffsetY?: number;
 
   // Marker type + sticker/swap fields
   type?: MarkerKind;
