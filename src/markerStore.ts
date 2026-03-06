@@ -99,16 +99,23 @@ export interface TextLayer {
 
   rect: { x0: number; y0: number; x1: number; y1: number };
   lines: TextBaseline[];
+  
+  autoFlow?: boolean;
 
   allowAngledBaselines?: boolean;
   style: TextLayerStyle;
 }
 
-export type MarkerKind = "pin" | "sticker" | "swap";
+export type MarkerKind = "pin" | "sticker" | "swap" | "switch";
 
 export type PingDistanceUnit = "m" | "km" | "mi" | "ft" | "custom";
 
 export type AnchorSpace = "world" | "viewport";
+
+export interface DiceRollSpec {
+  count: number;
+  sides: number;
+}
 
 export interface Marker {
   id: string;
@@ -151,6 +158,13 @@ export interface Marker {
   
   // Per-marker override links for swap pins (frameIndex -> link)
   swapLinks?: Record<number, string>;
+  
+  // Switch pin (base switcher)
+  switchBase?: string;      // path to base image (optional; if empty => rotate)
+  switchRotate?: boolean;   // if true: cycle through bases on right click
+  
+  diceRolls?: DiceRollSpec[];
+  diceRender3d?: boolean;
   
   // Ping pins (special markers that create/update a ping note) 
   pingPresetId?: string;

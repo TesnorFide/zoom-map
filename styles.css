@@ -4,6 +4,23 @@
   grid-template-columns: 28px 12ch 36px minmax(220px, 1fr) 7ch 7ch 7ch 7ch 36px;
 }
 
+.zoommap-dice-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.zoommap-dice-row {
+  display: grid;
+  grid-template-columns: 8ch 10ch auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.zoommap-dice-row input[type="number"] {
+  width: 8ch;
+}
+
 .zoommap-settings.zoommap-settings--imgpreview .zoommap-settings__icon-preview--img {
   width: 24px;
   height: 24px;
@@ -943,6 +960,17 @@ body.zm-cursor-resize-nwse {
 
 body.zm-cursor-resize-nesw {
   cursor: nesw-resize;
+}
+
+/* Text layer move mode */
+.zm-text-hitbox.zm-text-hitbox--move {
+  cursor: grab;
+}
+.zm-text-hitbox.zm-text-hitbox--move.zm-text-hitbox--dragging {
+  cursor: grabbing;
+}
+body.zm-cursor-move-grabbing {
+  cursor: grabbing;
 }
 
 /* Always-visible marker label (tooltip caption) */

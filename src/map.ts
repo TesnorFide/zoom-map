@@ -15,6 +15,7 @@ import type {
   TextLayer,
   TextBaseline,
   TextLayerStyle,
+  DiceRollSpec,
 } from "./markerStore";
 import type ZoomMapPlugin from "./main";
 import { MarkerEditorModal } from "./markerEditor";
@@ -31,6 +32,8 @@ import { TextLayerStyleModal } from "./textLayerStyleModal";
 import { SvgRasterExportModal } from "./svgRasterExportModal";
 import { SwapLinksEditorModal, type SwapLinksEditorResult } from "./swapLinksEditorModal";
 import { MeasureTerrainModal, type MeasureTerrainSegment } from "./measureTerrainModal";
+import { SwitchPinModal, type SwitchPinModalResult } from "./switchPinModal";
+import { DicePinModal } from "./dicePinModal";
 import type { ScaleUnitValue } from "./scaleCalibrateModal";
 
 /* ===== Collections (base-bound) ===== */
@@ -317,6 +320,47 @@ function isSvgDataUrl(src: string): boolean {
   return typeof src === "string" && src.startsWith("data:image/svg+xml");
 }
 
+function diceRollsToFormula(rolls: DiceRollSpec[] | undefined): string {
+  const parts = (rolls ?? [])
+    .filter((r) => r && Number.isFinite(r.count) && Number.isFinite(r.sides) && r.count > 0 && r.sides > 0)
+    .map((r) => `${Math.round(r.count)}d${Math.round(r.sides)}`);
+  return parts.length ? parts.join(" + ") : "1d20";
+}
+
+function localRollDice(rolls: DiceRollSpec[] | undefined): { total: number; details: string } {
+  const rs = (rolls ?? []).filter((r) => r && Number.isFinite(r.count) && Number.isFinite(r.sides) && r.count > 0 && r.sides > 1);
+  const cleaned = rs.length ? rs : [{ count: 1, sides: 20 }];
+
+  const per: string[] = [];
+  let total = 0;
+
+  for (const r of cleaned) {
+    const n = Math.max(1, Math.round(r.count));
+    const s = Math.max(2, Math.round(r.sides));
+    const vals: number[] = [];
+    for (let i = 0; i < n; i += 1) {
+      const v = 1 + Math.floor(Math.random() * s);
+      vals.push(v);
+      total += v;
+    }
+    per.push(`${n}d${s}=[${vals.join(", ")}]`);
+  }
+
+  return { total, details: per.join(" + ") };
+}
+
+function formatDiceApiResult(x: unknown): string {
+  if (x == null) return "";
+  if (typeof x === "string") return x;
+  if (typeof x === "number" || typeof x === "boolean" || typeof x === "bigint") return String(x);
+  if (x instanceof Error) return x.message || "Error";
+  try {
+    return JSON.stringify(x);
+  } catch {
+    return "";
+  }
+}
+
 // --- Blockquote / callout helpers (for embedded zoommap blocks) ---
 function splitQuotePrefix(line: string): { prefix: string; rest: string } {
   const len = line.length;
@@ -496,6 +540,11 @@ export class MapInstance extends Component {
   private textSaveTimer: number | null = null;
 
   private textOutsideCleanup: (() => void) | null = null;
+  
+  private textMoveDragging = false;
+  private textMovePointerId: number | null = null;
+  private textMoveStart: Point | null = null;
+  private textMoveOrig: { rect: TextLayer["rect"]; lines: TextBaseline[] } | null = null;
 
   private textMeasureSpan: HTMLSpanElement | null = null;
   
@@ -1453,6 +1502,61 @@ export class MapInstance extends Component {
     this.baseIsSvg = isSvg;
     this.el.classList.toggle("zm-root--svg-base", isSvg);
   }
+  
+  private async applySwitchPin(m: Marker): Promise<void> {
+    if (!this.data) return;
+    if (m.type !== "switch") return;
+
+    const bases = this.getBasesNormalized();
+    if (!bases.length) return;
+
+    const current = this.getActiveBasePath();
+
+    const rotate = !!m.switchRotate || !(typeof m.switchBase === "string" && m.switchBase.trim().length > 0);
+
+    if (rotate) {
+      const idx = bases.findIndex((b) => b.path === current);
+      const next = bases[((idx >= 0 ? idx : 0) + 1) % bases.length]?.path;
+      if (next) await this.setActiveBase(next);
+      return;
+    }
+
+    const target = (m.switchBase ?? "").trim();
+    if (!target) return;
+
+    const exists = bases.some((b) => b.path === target);
+    if (exists) {
+      await this.setActiveBase(target);
+    } else {
+      const idx = bases.findIndex((b) => b.path === current);
+      const next = bases[((idx >= 0 ? idx : 0) + 1) % bases.length]?.path;
+      if (next) await this.setActiveBase(next);
+    }
+  }
+
+  private openSwitchPinModal(opts: {
+    basePaths: BaseImage[];
+    initialIconKey: string;
+    initialRotate: boolean;
+    initialSwitchBase?: string;
+    initialScaleLikeSticker: boolean;
+    initialHud: boolean;
+  }, onDone: (res: SwitchPinModalResult) => void): void {
+    const modal = new SwitchPinModal(
+      this.app,
+      this.plugin,
+      {
+        bases: opts.basePaths,
+        iconKey: opts.initialIconKey,
+        rotate: opts.initialRotate,
+        switchBase: opts.initialSwitchBase,
+        scaleLikeSticker: opts.initialScaleLikeSticker,
+        placeAsHudPin: opts.initialHud,
+      },
+      onDone,
+    );
+    modal.open();
+  }
 
   onload(): void {
     void this.bootstrap().catch((err: unknown) => {
@@ -1672,6 +1776,16 @@ export class MapInstance extends Component {
 
     this.registerDomEvent(window, "keydown", (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+	  
+      if (this.textMode === "move") {
+        this.finishTextLayerMove(false);
+        this.textMode = null;
+        this.activeTextLayerId = null;
+        this.renderTextDraft();
+        this.renderTextLayers();
+        this.closeMenu();
+        return;
+      }
 
       if (this.textMode === "edit") {
         this.stopTextEdit(true);
@@ -2379,6 +2493,23 @@ export class MapInstance extends Component {
       hb.style.width = `${r.w}px`;
       hb.style.height = `${r.h}px`;
       hb.ondragstart = (ev) => ev.preventDefault();
+	  
+      const moveActive = this.textMode === "move" && this.activeTextLayerId === layer.id;
+      if (moveActive) hb.classList.add("zm-text-hitbox--move");
+      else hb.classList.remove("zm-text-hitbox--move");
+
+      hb.addEventListener("pointerdown", (e: PointerEvent) => {
+        if (!this.data) return;
+        if (e.button !== 0) return;
+        if (!(this.plugin.settings.enableTextLayers)) return;
+        if (layer.locked) return;
+        if (!(this.textMode === "move" && this.activeTextLayerId === layer.id)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.plugin.setActiveMap(this);
+        const p = this.mouseEventToWorldNorm(e as unknown as MouseEvent);
+        this.startTextLayerMove(layer.id, p, e.pointerId, hb);
+      });
       
       hb.addEventListener("dblclick", (e) => {
         e.stopPropagation();
@@ -2388,6 +2519,10 @@ export class MapInstance extends Component {
         e.stopPropagation();
 		
 		if (this.suppressTextClickOnce) return;
+		
+        if (this.textMode === "move" && this.activeTextLayerId === layer.id) {
+          return;
+        }
 
         // Draw lines mode: clicks inside the layer define baselines
         if (this.textMode === "draw-lines" && this.activeTextLayerId === layer.id) {
@@ -2400,7 +2535,9 @@ export class MapInstance extends Component {
       });
 
       // Guides
-      const showNow = this.textMode === "draw-lines" && this.activeTextLayerId === layer.id;
+      const showNow =
+        (this.textMode === "draw-lines" || this.textMode === "move") &&
+        this.activeTextLayerId === layer.id;
 
       if (showNow) {
         const rect = document.createElementNS(ns, "rect");
@@ -2547,6 +2684,107 @@ export class MapInstance extends Component {
       y: clamp(wy / this.imgH, 0, 1),
     };
   }
+  
+  private clampTextLayerDelta(
+    rect: { x0: number; y0: number; x1: number; y1: number },
+    dx: number,
+    dy: number,
+  ): { dx: number; dy: number } {
+    const minX = Math.min(rect.x0, rect.x1);
+    const maxX = Math.max(rect.x0, rect.x1);
+    const minY = Math.min(rect.y0, rect.y1);
+    const maxY = Math.max(rect.y0, rect.y1);
+
+    const dxClamped = clamp(dx, -minX, 1 - maxX);
+    const dyClamped = clamp(dy, -minY, 1 - maxY);
+    return { dx: dxClamped, dy: dyClamped };
+  }
+
+  private startTextLayerMove(layerId: string, start: Point, pointerId: number, host: HTMLElement): void {
+    if (!this.data) return;
+    const layer = (this.data.textLayers ?? []).find((l) => l.id === layerId);
+    if (!layer) return;
+    if (layer.locked) {
+      new Notice("Text layer is locked.", 1500);
+      return;
+    }
+
+    this.stopTextEdit(true);
+    this.measuring = false;
+    this.calibrating = false;
+    this.drawingMode = null;
+
+    this.textMode = "move";
+    this.activeTextLayerId = layerId;
+
+    this.textMoveDragging = true;
+    this.textMovePointerId = pointerId;
+    this.textMoveStart = start;
+    this.textMoveOrig = {
+      rect: { ...layer.rect },
+      lines: (layer.lines ?? []).map((ln) => ({ ...ln })),
+    };
+
+    host.classList.add("zm-text-hitbox--dragging");
+    document.body.classList.add("zm-cursor-move-grabbing");
+    host.setPointerCapture?.(pointerId);
+  }
+
+  private updateTextLayerMove(cur: Point): void {
+    if (!this.data) return;
+    if (!this.textMoveDragging || !this.textMoveStart || !this.textMoveOrig || !this.activeTextLayerId) return;
+
+    const layer = (this.data.textLayers ?? []).find((l) => l.id === this.activeTextLayerId);
+    if (!layer) return;
+    if (layer.locked) return;
+
+    const dxRaw = cur.x - this.textMoveStart.x;
+    const dyRaw = cur.y - this.textMoveStart.y;
+    const { dx, dy } = this.clampTextLayerDelta(this.textMoveOrig.rect, dxRaw, dyRaw);
+
+    layer.rect = {
+      x0: this.textMoveOrig.rect.x0 + dx,
+      y0: this.textMoveOrig.rect.y0 + dy,
+      x1: this.textMoveOrig.rect.x1 + dx,
+      y1: this.textMoveOrig.rect.y1 + dy,
+    };
+
+    const srcLines = this.textMoveOrig.lines;
+    layer.lines ??= [];
+    if (layer.lines.length !== srcLines.length) {
+      const byId = new Map(layer.lines.map((ln) => [ln.id, ln]));
+      layer.lines = srcLines.map((s) => {
+        const existing = byId.get(s.id);
+        return existing ?? { ...s };
+      });
+    }
+
+    for (let i = 0; i < srcLines.length; i += 1) {
+      const s = srcLines[i];
+      const ln = layer.lines[i];
+      ln.x0 = s.x0 + dx;
+      ln.y0 = s.y0 + dy;
+      ln.x1 = s.x1 + dx;
+      ln.y1 = s.y1 + dy;
+    }
+
+    this.renderTextLayers();
+  }
+
+  private finishTextLayerMove(commit: boolean): void {
+    if (!this.textMoveDragging) return;
+    this.textMoveDragging = false;
+    this.textMovePointerId = null;
+    this.textMoveStart = null;
+    this.textMoveOrig = null;
+    document.body.classList.remove("zm-cursor-move-grabbing");
+
+    this.textHitEl?.querySelectorAll(".zm-text-hitbox--dragging").forEach((el) => el.classList.remove("zm-text-hitbox--dragging"));
+
+    if (commit) {
+      void this.saveDataSoon();
+    }
+  }
 
   private startTextEdit(layerId: string, focus?: Point): void {
     if (!this.data) return;
@@ -2555,6 +2793,7 @@ export class MapInstance extends Component {
     this.measuring = false;
     this.calibrating = false;
     this.drawingMode = null;
+	this.finishTextLayerMove(false);
 
     this.stopTextEdit(true);
 
@@ -2564,6 +2803,8 @@ export class MapInstance extends Component {
 
     const layer = (this.data.textLayers ?? []).find((l) => l.id === layerId);
     if (!layer) return;
+	
+    if (typeof layer.autoFlow !== "boolean") layer.autoFlow = true;
 
     layer.style = this.normalizeTextLayerStyle(layer.style);
 
@@ -2650,7 +2891,7 @@ export class MapInstance extends Component {
           return;
         }
 		
-		if (e.key === "Backspace") {
+		if (e.key === "Backspace" && layer.autoFlow !== false) {
         const selStart = input.selectionStart ?? 0;
         const selEnd = input.selectionEnd ?? selStart;
 
@@ -2719,6 +2960,14 @@ export class MapInstance extends Component {
 		new Notice("Text layer is locked.", 1200);
 		return;
 	  }
+	  
+        // Fixed-lines mode: do NOT reflow between baselines.
+        if (layer.autoFlow === false) {
+          ln.text = input.value;
+          this.textDirty = true;
+          this.scheduleTextSave();
+          return;
+        }
 
 	  // If the user is typing at the end of the line, we can safely advance focus on overflow.
 	  const selStart = input.selectionStart ?? input.value.length;
@@ -3167,9 +3416,9 @@ export class MapInstance extends Component {
       id: generateId("txt"),
       name: `Text layer ${idx}`,
       locked: false,
-      showGuides: true,
       rect,
       lines: [],
+	  autoFlow: true,
       allowAngledBaselines: false,
       style: this.defaultTextLayerStyle(),
     };
@@ -3931,6 +4180,20 @@ export class MapInstance extends Component {
 
   private onPointerMove(e: PointerEvent): void {
     if (!this.ready) return;
+	
+    // Text layer move drag
+    if (this.textMoveDragging) {
+      e.preventDefault();
+      e.stopPropagation();
+      const vpRect = this.viewportEl.getBoundingClientRect();
+      const vx = e.clientX - vpRect.left;
+      const vy = e.clientY - vpRect.top;
+      const wx = (vx - this.tx) / this.scale;
+      const wy = (vy - this.ty) / this.scale;
+      const p = { x: clamp(wx / this.imgW, 0, 1), y: clamp(wy / this.imgH, 0, 1) };
+      this.updateTextLayerMove(p);
+      return;
+    }
 
     // Prevent workspace edge-swipe gestures while actively panning/zooming on touch devices.
     if (e.pointerType === "touch") {
@@ -4072,6 +4335,11 @@ export class MapInstance extends Component {
   }
 
   private onPointerUp(): void {
+	  
+  if (this.textMoveDragging) {
+      this.finishTextLayerMove(true);
+      return;
+    }
 	  
   if (this.textMode === "draw-layer" && this.textDrawStart && this.textDrawPreview) {
       this.finishDrawNewTextLayer();
@@ -4609,6 +4877,81 @@ this.viewDragDist = 0;
     this.renderMarkersOnly();
     new Notice("Swap pin added.", 900);
   }
+  
+  private async rollDiceMarker(m: Marker): Promise<void> {
+    if (!this.data) return;
+    if (m.type !== "dice") return;
+
+    const rolls = m.diceRolls ?? [{ count: 1, sides: 20 }];
+    const formula = diceRollsToFormula(rolls);
+    const want3d = !!m.diceRender3d;
+
+    const w = window as unknown as { DiceRoller?: unknown };
+    const api = w.DiceRoller as
+      | {
+          parseDice?: (content: string, source?: string) => Promise<{ result: unknown }>;
+        }
+      | undefined;
+
+    if (want3d) {
+      const ws = this.app.workspace as unknown as { trigger?: (name: string, ...args: unknown[]) => void };
+      if (ws && typeof ws.trigger === "function") {
+        try {
+          ws.trigger("dice-roller:render-dice", `${formula}|render`);
+          return;
+        } catch {
+          // fall through
+        }
+      }
+    }
+
+    if (api && typeof api.parseDice === "function") {
+      try {
+        const res = await api.parseDice(formula, this.cfg.sourcePath);
+        new Notice(`Roll: ${formula}\nResult: ${formatDiceApiResult(res?.result)}`.trim(), 5000);
+        return;
+      } catch {
+        // fall through
+      }
+    }
+
+    const local = localRollDice(rolls);
+    new Notice(`Roll: ${formula}\n${local.details}\nTotal: ${local.total}`, 6000);
+  }
+
+  private addDicePinHere(nx: number, ny: number): void {
+    if (!this.data) return;
+
+    const iconKey = this.plugin.settings.defaultIconKey;
+    const layerId = this.getPreferredNewMarkerLayerId();
+
+    new DicePinModal(
+      this.app,
+      this.plugin,
+      { iconKey, rolls: [{ count: 1, sides: 20 }], render3d: false },
+      (res) => {
+        if (!this.data) return;
+        if (res.action !== "save") return;
+
+        const marker: Marker = {
+          id: generateId("dice"),
+          type: "dice",
+          x: nx,
+          y: ny,
+          layer: layerId,
+          iconKey: res.value.iconKey,
+          diceRolls: res.value.rolls,
+          diceRender3d: res.value.render3d ? true : undefined,
+          tooltip: diceRollsToFormula(res.value.rolls),
+        };
+
+        this.data.markers.push(marker);
+        void this.saveDataSoon();
+        this.renderMarkersOnly();
+        new Notice("Dice pin added.", 900);
+      },
+    ).open();
+  }
 
 private onContextMenuViewport(e: MouseEvent): void {
     if (!this.ready || !this.data) return;
@@ -4877,6 +5220,63 @@ private onContextMenuViewport(e: MouseEvent): void {
       },
     );
 	
+    addHereChildren.push({
+      label: "Add base switch pin here…",
+      action: () => {
+        if (!this.data) return;
+        const bases = this.getBasesNormalized();
+        if (!bases.length) {
+          new Notice("No base images configured.", 2500);
+          return;
+        }
+
+        const iconKey = this.plugin.settings.defaultIconKey;
+        const initialScaleLike =
+          this.plugin.settings.defaultScaleLikeSticker ? true : false;
+
+        this.openSwitchPinModal(
+          {
+            basePaths: bases,
+            initialIconKey: iconKey,
+            initialRotate: true,
+            initialSwitchBase: undefined,
+            initialScaleLikeSticker: initialScaleLike,
+            initialHud: false,
+          },
+          (res) => {
+            if (!this.data) return;
+            if (res.action !== "save" || !res.value) return;
+
+            const marker: Marker = {
+              id: generateId("swb"),
+              type: "switch",
+              layer: this.getPreferredNewMarkerLayerId(),
+              x: nx,
+              y: ny,
+              iconKey: res.value.iconKey,
+              switchRotate: res.value.rotate ? true : undefined,
+              switchBase: res.value.rotate ? undefined : (res.value.switchBase ?? undefined),
+              scaleLikeSticker: res.value.scaleLikeSticker ? true : undefined,
+            };
+
+            if (res.value.placeAsHudPin) {
+              marker.anchorSpace = "viewport";
+              marker.hudX = vx;
+              marker.hudY = vy;
+              this.classifyHudMetaFromCurrentPosition(marker, this.viewportEl.getBoundingClientRect());
+            }
+
+            this.data.markers.push(marker);
+            void this.saveDataSoon();
+            this.renderMarkersOnly();
+            new Notice("Switch pin added.", 900);
+          },
+        );
+
+        this.closeMenu();
+      },
+    });
+	
     // ---- Ping pins ----
     {
       const allPings: PingPreset[] = [...pingBase, ...pingGlobal].filter(Boolean);
@@ -4937,6 +5337,17 @@ private onContextMenuViewport(e: MouseEvent): void {
         })),
       });
     }
+	
+    addHereChildren.push(
+      { type: "separator" },
+      {
+        label: "Add dice pin here…",
+        action: () => {
+          this.addDicePinHere(nx, ny);
+          this.closeMenu();
+        },
+      },
+    );
 
     const items: ZMMenuItem[] = [
       { label: "Add marker here", children: addHereChildren },
@@ -5436,6 +5847,13 @@ if (this.plugin.settings.enableTextLayers && this.data) {
             new Notice("Text layer is locked.", 1500);
             return;
           }
+		  
+            // If move mode is active on this layer, leave it before editing style.
+            if (this.textMode === "move" && this.activeTextLayerId === tl.id) {
+              this.finishTextLayerMove(true);
+              this.textMode = null;
+              this.activeTextLayerId = null;
+            }
 
           new TextLayerStyleModal(this.app, tl, (res) => {
             if (res.action !== "save" || !this.data) return;
@@ -5472,6 +5890,36 @@ if (this.plugin.settings.enableTextLayers && this.data) {
           if (chk) chk.textContent = tl.locked ? "✓" : "";
         },
       },
+      {
+        label: "Move",
+        checked: this.textMode === "move" && this.activeTextLayerId === tl.id,
+        action: (rowEl) => {
+          if (tl.locked) {
+            new Notice("Text layer is locked.", 1500);
+            return;
+          }
+
+          const isOn = this.textMode === "move" && this.activeTextLayerId === tl.id;
+          if (isOn) {
+            // turn off
+            this.finishTextLayerMove(true);
+            this.textMode = null;
+            this.activeTextLayerId = null;
+          } else {
+            this.stopTextEdit(true);
+            this.finishTextLayerMove(false);
+            this.textMode = "move";
+            this.activeTextLayerId = tl.id;
+            new Notice("Move mode: drag the box to move the text layer. Toggle move again to stop.", 4000);
+          }
+
+          this.renderTextDraft();
+          this.renderTextLayers();
+
+          const chk = rowEl.querySelector<HTMLElement>(".zm-menu__check");
+          if (chk) chk.textContent = isOn ? "" : "✓";
+        },
+      },
       { type: "separator" },
       {
         label: "Draw lines",
@@ -5479,6 +5927,12 @@ if (this.plugin.settings.enableTextLayers && this.data) {
           if (tl.locked) {
             new Notice("Text layer is locked.", 1500);
             return;
+          }
+          // leave move mode if active
+          this.finishTextLayerMove(true);
+          if (this.textMode === "move" && this.activeTextLayerId === tl.id) {
+            this.textMode = null;
+            this.activeTextLayerId = null;
           }
           this.stopTextEdit(true);
           this.textMode = "draw-lines";
@@ -8579,6 +9033,11 @@ if (this.plugin.settings.enableTextLayers && this.data) {
         ev.stopPropagation();
         if (this.suppressClickMarkerId === m.id || this.dragMoved) return;
         if (m.type === "sticker") return;
+		if (m.type === "switch") return;
+        if (m.type === "dice") {
+          void this.rollDiceMarker(m);
+          return;
+        }
         this.openMarkerLink(m);
       });
 	  
@@ -8660,6 +9119,152 @@ if (this.plugin.settings.enableTextLayers && this.data) {
         ev.preventDefault();
         ev.stopPropagation();
         this.closeMenu();
+		
+        if (m.type === "switch") {
+          if (!ev.altKey) {
+            void this.applySwitchPin(m);
+            return;
+          }
+
+          const items: ZMMenuItem[] = [
+            {
+              label: "Switch base now",
+              action: () => {
+                this.closeMenu();
+                void this.applySwitchPin(m);
+              },
+            },
+            {
+              label: "Edit switch pin…",
+              action: () => {
+                this.closeMenu();
+                if (!this.data) return;
+
+                const bases = this.getBasesNormalized();
+                if (!bases.length) {
+                  new Notice("No base images configured.", 2500);
+                  return;
+                }
+
+                this.openSwitchPinModal(
+                  {
+                    basePaths: bases,
+                    initialIconKey: (m.iconKey ?? this.plugin.settings.defaultIconKey).trim() || this.plugin.settings.defaultIconKey,
+                    initialRotate: !!m.switchRotate || !(typeof m.switchBase === "string" && m.switchBase.trim().length > 0),
+                    initialSwitchBase: m.switchBase,
+                    initialScaleLikeSticker: !!m.scaleLikeSticker,
+                    initialHud: m.anchorSpace === "viewport",
+                  },
+                  (res) => {
+                    if (!this.data) return;
+                    if (res.action !== "save" || !res.value) return;
+
+                    m.iconKey = res.value.iconKey;
+
+                    if (res.value.rotate) {
+                      m.switchRotate = true;
+                      delete m.switchBase;
+                    } else {
+                      delete m.switchRotate;
+                      m.switchBase = (res.value.switchBase ?? "").trim() || undefined;
+                    }
+
+                    if (res.value.scaleLikeSticker) m.scaleLikeSticker = true;
+                    else delete m.scaleLikeSticker;
+
+                    if (res.value.placeAsHudPin) {
+                      if (m.anchorSpace !== "viewport") {
+                        m.anchorSpace = "viewport";
+                        m.hudX = (m.hudX ?? 0);
+                        m.hudY = (m.hudY ?? 0);
+                        this.classifyHudMetaFromCurrentPosition(m, this.viewportEl.getBoundingClientRect());
+                      }
+                    } else {
+                      // Keep coordinates as-is; only switch rendering space back to world.
+                      delete m.anchorSpace;
+                      delete m.hudX;
+                      delete m.hudY;
+                      delete m.hudModeX;
+                      delete m.hudModeY;
+                      delete m.hudLastWidth;
+                      delete m.hudLastHeight;
+                    }
+
+                    void this.saveDataSoon();
+                    this.renderMarkersOnly();
+                  },
+                );
+              },
+            },
+            {
+              label: "Delete switch pin",
+              action: () => {
+                this.closeMenu();
+                this.deleteMarker(m);
+              },
+            },
+          ];
+
+          this.openMenu = new ZMMenu(this.el.ownerDocument);
+          this.openMenu.open(ev.clientX, ev.clientY, items);
+          return;
+        }
+		
+        if (m.type === "dice") {
+          const items: ZMMenuItem[] = [
+            {
+              label: "Roll dice",
+              action: () => {
+                this.closeMenu();
+                void this.rollDiceMarker(m);
+              },
+            },
+            {
+              label: "Edit dice pin…",
+              action: () => {
+                this.closeMenu();
+                if (!this.data) return;
+
+                new DicePinModal(
+                  this.app,
+                  this.plugin,
+                  {
+                    iconKey: (m.iconKey ?? this.plugin.settings.defaultIconKey).trim(),
+                    rolls: m.diceRolls ?? [{ count: 1, sides: 20 }],
+                    render3d: !!m.diceRender3d,
+                  },
+                  (res) => {
+                    if (!this.data) return;
+                    if (res.action !== "save") return;
+
+                    m.type = "dice";
+                    m.iconKey = res.value.iconKey;
+                    m.diceRolls = res.value.rolls;
+                    if (res.value.render3d) m.diceRender3d = true;
+                    else delete m.diceRender3d;
+                    if (!m.tooltip || m.tooltip.trim() === diceRollsToFormula(m.diceRolls ?? [])) {
+                      m.tooltip = diceRollsToFormula(res.value.rolls);
+                    }
+
+                    void this.saveDataSoon();
+                    this.renderMarkersOnly();
+                  },
+                ).open();
+              },
+            },
+            {
+              label: "Delete dice pin",
+              action: () => {
+                this.closeMenu();
+                this.deleteMarker(m);
+              },
+            },
+          ];
+
+          this.openMenu = new ZMMenu(this.el.ownerDocument);
+          this.openMenu.open(ev.clientX, ev.clientY, items);
+          return;
+        }
 		
         if (m.type === "ping") {
           const items: ZMMenuItem[] = [

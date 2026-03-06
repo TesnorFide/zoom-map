@@ -91,6 +91,8 @@ export class TextLayerStyleModal extends Modal {
     this.original = layer;
     this.working = deepClone(layer);
     this.onDone = onDone;
+	
+	if (typeof this.working.autoFlow !== "boolean") this.working.autoFlow = true;
 
     this.working.style = this.normalizeStyle(this.working.style);
   }
@@ -232,6 +234,15 @@ export class TextLayerStyleModal extends Modal {
     });
 
     contentEl.createEl("h3", { text: "Layout" });
+	
+    new Setting(contentEl)
+      .setName("Auto-flow between baselines")
+      .setDesc("If disabled: each baseline keeps its own text (no pushing/pulling). Useful for one value per line (e.g. skill numbers).")
+      .addToggle((tg) => {
+        tg.setValue(this.working.autoFlow !== false).onChange((on) => {
+          this.working.autoFlow = on ? true : false;
+        });
+      });
 
     new Setting(contentEl)
       .setName("Line height (px)")
@@ -291,6 +302,10 @@ export class TextLayerStyleModal extends Modal {
       this.original.name = this.working.name;
       this.original.allowAngledBaselines = !!this.working.allowAngledBaselines;
       this.original.style = this.working.style;
+	  
+      // Persist only when explicitly disabled; enabled is the default.
+      if (this.working.autoFlow === false) this.original.autoFlow = false;
+      else delete (this.original as unknown as { autoFlow?: unknown }).autoFlow;
 
       this.close();
       this.onDone({
