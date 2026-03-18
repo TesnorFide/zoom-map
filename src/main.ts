@@ -150,6 +150,8 @@ const DEFAULT_SETTINGS: ZoomMapSettingsExtended = {
   svgRasterMaxScale: 8,
   showImageIconPreviewInSettings: false,
   middleClickOpensLinkInNewTab: false,
+  enableSecondScreen: false,
+  secondScreenFolder: "ZoomMap/SecondScreen",
 };
 
 /* ---------------- YAML parsing helpers ---------------- */
@@ -207,6 +209,7 @@ interface YamlOptions {
     bottom?: number | string;
     left?: number | string;
   };
+  displayOnly?: boolean;
 }
 
 function parseBasesYaml(v: unknown): YamlBase[] {
@@ -656,6 +659,7 @@ export default class ZoomMapPlugin extends Plugin {
 		  mapId,
 		  responsive,
 		  yamlMarkerLayers: markerLayersFromYaml,
+          displayOnly: !!opts.displayOnly,
 		  initialZoom,
 		  initialCenter,
           viewportFrame: typeof opts.viewportFrame === "string" ? opts.viewportFrame.trim() : undefined,
@@ -808,6 +812,8 @@ export default class ZoomMapPlugin extends Plugin {
 	this.settings.svgRasterMaxScale ??= 8;
 	this.settings.showImageIconPreviewInSettings ??= false;
 	this.settings.middleClickOpensLinkInNewTab ??= false;
+    this.settings.enableSecondScreen ??= false;
+    this.settings.secondScreenFolder ??= "ZoomMap/SecondScreen";
     // Icons: collection filter toggle
     for (const ico of (this.settings.icons ?? [])) {
       if (typeof (ico as { inCollections?: unknown }).inCollections !== "boolean") {

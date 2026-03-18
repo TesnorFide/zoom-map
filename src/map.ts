@@ -1,6 +1,6 @@
 import { Component, Modal, Notice, TFile, parseYaml, stringifyYaml, normalizePath } from "obsidian";
 import type { App } from "obsidian";
-import { generateId, MarkerStore } from "./markerStore";
+import { generateId, MarkerStore, sanitizeMarkerFileDataForSave } from "./markerStore";
 import type {
   Marker,
   MarkerFileData,
@@ -33,6 +33,7 @@ import { SvgRasterExportModal } from "./svgRasterExportModal";
 import { SwapLinksEditorModal, type SwapLinksEditorResult } from "./swapLinksEditorModal";
 import { MeasureTerrainModal, type MeasureTerrainSegment } from "./measureTerrainModal";
 import { SwitchPinModal, type SwitchPinModalResult } from "./switchPinModal";
+import { SecondScreenLayersModal } from "./secondScreenLayersModal";
 import { DicePinModal } from "./dicePinModal";
 import type { ScaleUnitValue } from "./scaleCalibrateModal";
 
@@ -162,6 +163,7 @@ export interface ZoomMapConfig {
     bottom: number;
     left: number;
   };
+  displayOnly?: boolean;
 }
 
 export interface IconProfile {
@@ -259,6 +261,8 @@ export interface ZoomMapSettings {
   preferCanvasImagesWhenCaching?: boolean;
   showImageIconPreviewInSettings?: boolean;
   middleClickOpensLinkInNewTab?: boolean;
+  enableSecondScreen?: boolean;
+  secondScreenFolder?: string;
 }
 
 interface Point { x: number; y: number; }
@@ -452,6 +456,10 @@ function tintSvgMarkupLocal(svg: string, color: string): string {
 function getMinZoom(m: Marker): number | undefined { return m.minZoom; }
 function getMaxZoom(m: Marker): number | undefined { return m.maxZoom; }
 function isScaleLikeSticker(m: Marker): boolean { return !!m.scaleLikeSticker; }
+
+interface ScreenDisplayPluginApi {
+  sendNoteByPath(path: string): Promise<void>;
+}
 
 export class MapInstance extends Component {
   private app: App;
@@ -1284,6 +1292,280 @@ export class MapInstance extends Component {
   }
   
   private tintedSvgCache: Map<string, string> = new Map<string, string>();
+  
+  private getScreenDisplayPlugin(): ScreenDisplayPluginApi | null {
+    const registry =
+      (this.app as unknown as {
+        plugins?: { plugins?: Record<string, unknown> };
+      }).plugins?.plugins ?? {};
+
+    const raw = registry["ttrpg-tools-screen"] as
+      | { sendNoteByPath?: (path: string) => Promise<void> }
+      | undefined;
+
+    if (!raw || typeof raw.sendNoteByPath !== "function") return null;
+    return { sendNoteByPath: raw.sendNoteByPath.bind(raw) };
+  }
+
+  private secondScreenFeatureEnabled(): boolean {
+    return !!this.plugin.settings.enableSecondScreen;
+  }
+
+  private ensureSecondScreenConfig(): NonNullable<MarkerFileData["secondScreen"]> {
+    if (!this.data) throw new Error("Map data not loaded.");
+    this.data.secondScreen ??= {};
+    return this.data.secondScreen;
+  }
+
+  private getSecondScreenSelectedIds(): {
+    markerLayerIds: Set<string>;
+    drawLayerIds: Set<string>;
+    textLayerIds: Set<string>;
+  } {
+    if (!this.data) {
+      return {
+        markerLayerIds: new Set(),
+        drawLayerIds: new Set(),
+        textLayerIds: new Set(),
+      };
+    }
+
+    const sec = this.ensureSecondScreenConfig();
+
+    const markerLayerIds = Array.isArray(sec.markerLayerIds)
+      ? new Set(sec.markerLayerIds)
+      : new Set((this.data.layers ?? []).map((l) => l.id));
+
+    const drawLayerIds = Array.isArray(sec.drawLayerIds)
+      ? new Set(sec.drawLayerIds)
+      : new Set((this.data.drawLayers ?? []).map((l) => l.id));
+
+    const textLayerIds = Array.isArray(sec.textLayerIds)
+      ? new Set(sec.textLayerIds)
+      : new Set((this.data.textLayers ?? []).map((l) => l.id));
+
+    return { markerLayerIds, drawLayerIds, textLayerIds };
+  }
+
+  private openSecondScreenLayersModal(): void {
+    if (!this.data) return;
+
+    const sec = this.ensureSecondScreenConfig();
+
+    const markerSelected = Array.isArray(sec.markerLayerIds)
+      ? new Set(sec.markerLayerIds)
+      : new Set((this.data.layers ?? []).map((l) => l.id));
+
+    const drawSelected = Array.isArray(sec.drawLayerIds)
+      ? new Set(sec.drawLayerIds)
+      : new Set((this.data.drawLayers ?? []).map((l) => l.id));
+
+    const textSelected = Array.isArray(sec.textLayerIds)
+      ? new Set(sec.textLayerIds)
+      : new Set((this.data.textLayers ?? []).map((l) => l.id));
+
+    new SecondScreenLayersModal(
+      this.app,
+      {
+        markerLayers: (this.data.layers ?? []).map((l) => ({
+          id: l.id,
+          name: l.name ?? "Layer",
+          selected: markerSelected.has(l.id),
+        })),
+        drawLayers: (this.data.drawLayers ?? []).map((l) => ({
+          id: l.id,
+          name: l.name ?? "Draw layer",
+          selected: drawSelected.has(l.id),
+        })),
+        textLayers: (this.data.textLayers ?? []).map((l) => ({
+          id: l.id,
+          name: l.name ?? "Text layer",
+          selected: textSelected.has(l.id),
+        })),
+      },
+      (res) => {
+        if (res.action !== "save" || !this.data) return;
+        const cfg = this.ensureSecondScreenConfig();
+        cfg.markerLayerIds = res.markerLayerIds;
+        cfg.drawLayerIds = res.drawLayerIds;
+        cfg.textLayerIds = res.textLayerIds;
+        void this.saveDataSoon();
+        new Notice("Player screen layer setup saved.", 1200);
+      },
+    ).open();
+  }
+
+  private buildSecondScreenSnapshot(): MarkerFileData {
+    if (!this.data) throw new Error("Map data not loaded.");
+
+    const snapshot = JSON.parse(
+      JSON.stringify(sanitizeMarkerFileDataForSave(this.data)),
+    ) as MarkerFileData;
+
+    const { markerLayerIds, drawLayerIds, textLayerIds } = this.getSecondScreenSelectedIds();
+
+    snapshot.layers = (snapshot.layers ?? []).map((l) => ({
+      ...l,
+      visible: markerLayerIds.has(l.id),
+      locked: false,
+    }));
+    snapshot.markers = (snapshot.markers ?? []).filter((m) => markerLayerIds.has(m.layer));
+
+    snapshot.drawLayers = (snapshot.drawLayers ?? []).map((l) => ({
+      ...l,
+      visible: drawLayerIds.has(l.id),
+      locked: false,
+    }));
+    snapshot.drawings = (snapshot.drawings ?? []).filter((d) => drawLayerIds.has(d.layerId));
+
+    snapshot.textLayers = (snapshot.textLayers ?? []).filter((t) => textLayerIds.has(t.id));
+
+    return snapshot;
+  }
+
+  private getCurrentViewForSecondScreen():
+    | { zoom: number; centerX: number; centerY: number }
+    | null {
+    if (!this.imgW || !this.imgH) return null;
+
+    const r = this.viewportEl.getBoundingClientRect();
+    const vw = r.width || this.vw || 0;
+    const vh = r.height || this.vh || 0;
+    if (vw < 2 || vh < 2) return null;
+
+    const worldX = (vw / 2 - this.tx) / this.scale;
+    const worldY = (vh / 2 - this.ty) / this.scale;
+
+    return {
+      zoom: this.scale,
+      centerX: clamp(worldX / this.imgW, 0, 1),
+      centerY: clamp(worldY / this.imgH, 0, 1),
+    };
+  }
+  
+  private getCurrentOuterAspectForSecondScreen(): number | null {
+    const r = this.el.getBoundingClientRect();
+    const w = r.width || 0;
+    const h = r.height || 0;
+    if (w < 2 || h < 2) return null;
+    return w / h;
+  }
+
+  private buildSecondScreenNoteContent(markersPath: string): string {
+    const view = this.getCurrentViewForSecondScreen();
+    const aspect = this.getCurrentOuterAspectForSecondScreen();
+
+    // Must match the padding used by the Player Screen plugin:
+    // 16px on each side => 32px total available space reduction.
+    const padPx = 32;
+
+    const width =
+      aspect && Number.isFinite(aspect) && aspect > 0
+        ? `min(calc(100vw - ${padPx}px), calc((100vh - ${padPx}px) * ${aspect.toFixed(6)}))`
+        : `calc(100vw - ${padPx}px)`;
+
+    const height =
+      aspect && Number.isFinite(aspect) && aspect > 0
+        ? `min(calc((100vw - ${padPx}px) / ${aspect.toFixed(6)}), calc(100vh - ${padPx}px))`
+        : `calc(100vh - ${padPx}px)`;
+
+    const yaml: Record<string, unknown> = {
+      image: this.getActiveBasePath(),
+      markers: markersPath,
+      minZoom: this.cfg.minZoom,
+      maxZoom: this.cfg.maxZoom,
+      width,
+      height,
+      align: "center",
+      resizable: false,
+      responsive: false,
+      wrap: false,
+      render: this.cfg.renderMode,
+      displayOnly: true,
+    };
+
+    if (this.cfg.viewportFrame?.trim()) {
+      yaml.viewportFrame = this.cfg.viewportFrame.trim();
+    }
+
+    if (this.cfg.viewportFrameInsets) {
+      yaml.viewportFrameInsets = {
+        unit: this.cfg.viewportFrameInsets.unit,
+        top: this.cfg.viewportFrameInsets.top,
+        right: this.cfg.viewportFrameInsets.right,
+        bottom: this.cfg.viewportFrameInsets.bottom,
+        left: this.cfg.viewportFrameInsets.left,
+      };
+    }
+
+    if (view) {
+      yaml.view = {
+        zoom: Number(view.zoom.toFixed(4)),
+        centerX: Number(view.centerX.toFixed(6)),
+        centerY: Number(view.centerY.toFixed(6)),
+      };
+    }
+
+    return `\`\`\`zoommap\n${stringifyYaml(yaml).trimEnd()}\n\`\`\`\n`;
+  }
+
+  private async sendToSecondScreen(): Promise<void> {
+    if (!this.data) return;
+
+    if (!this.secondScreenFeatureEnabled()) {
+      new Notice("Player screen integration is disabled in preferences.", 2500);
+      return;
+    }
+
+    const screen = this.getScreenDisplayPlugin();
+    if (!screen) {
+      new Notice('Player screen plugin not found or not enabled.', 3500);
+      return;
+    }
+
+    const folder = normalizePath(
+      (this.plugin.settings.secondScreenFolder ?? "ZoomMap/SecondScreen").trim() ||
+      "ZoomMap/SecondScreen",
+    );
+
+    const sec = this.ensureSecondScreenConfig();
+
+    const stemBase =
+      this.cfg.mapId?.trim() ||
+      basename(this.getActiveBasePath()).replace(/\.[^.]+$/, "") ||
+      "map";
+
+    const safeStem = this.sanitizeFileName(`${stemBase}-screen`);
+    const notePath = normalizePath(sec.notePath ?? `${folder}/${safeStem}.md`);
+    const markersPath = normalizePath(sec.markersPath ?? `${folder}/${safeStem}.markers.json`);
+
+    await this.ensureFolderForPath(notePath);
+    await this.ensureFolderForPath(markersPath);
+
+    const snapshot = this.buildSecondScreenSnapshot();
+    const json = JSON.stringify(sanitizeMarkerFileDataForSave(snapshot), null, 2);
+    const noteContent = this.buildSecondScreenNoteContent(markersPath);
+
+    const markerAf = this.app.vault.getAbstractFileByPath(markersPath);
+    if (markerAf instanceof TFile) {
+      await this.app.vault.modify(markerAf, json);
+    } else {
+      await this.app.vault.create(markersPath, json);
+    }
+
+    const noteAf = this.app.vault.getAbstractFileByPath(notePath);
+    if (noteAf instanceof TFile) {
+      await this.app.vault.modify(noteAf, noteContent);
+    } else {
+      await this.app.vault.create(notePath, noteContent);
+    }
+
+    sec.notePath = notePath;
+    sec.markersPath = markersPath;
+    await this.saveDataSoon();
+
+    await screen.sendNoteByPath(notePath);
+  }
   
   private hasViewportFrame(): boolean {
     return typeof this.cfg.viewportFrame === "string" && this.cfg.viewportFrame.trim().length > 0;
@@ -4986,6 +5268,8 @@ this.viewDragDist = 0;
       return;
     }
 
+    if (this.cfg.displayOnly) return;
+
     if (e.shiftKey) {
       const vpRect = this.viewportEl.getBoundingClientRect();
       const vx = e.clientX - vpRect.left;
@@ -5396,6 +5680,7 @@ this.viewDragDist = 0;
 private onContextMenuViewport(e: MouseEvent): void {
     if (!this.ready || !this.data) return;
     this.closeMenu();
+    if (this.cfg.displayOnly) return;
 	
     if ((this.plugin.settings.panMouseButton ?? "left") === "right" && this.suppressContextMenuOnce) {
       this.suppressContextMenuOnce = false;
@@ -6565,9 +6850,33 @@ if (this.plugin.settings.enableTextLayers && this.data) {
               this.closeMenu();
             },
           },
-		],
-	  },
-	);
+          ...(this.secondScreenFeatureEnabled()
+            ? [
+                {
+                  label: "Player screen layers…",
+                  action: () => {
+                    this.closeMenu();
+                    this.openSecondScreenLayersModal();
+                  },
+                } as ZMMenuItem,
+              ]
+            : []),
+        ],
+      },
+    );
+	
+    if (this.secondScreenFeatureEnabled()) {
+      items.push(
+        { type: "separator" },
+        {
+          label: "Display on screen",
+          action: () => {
+            this.closeMenu();
+            void this.sendToSecondScreen();
+          },
+        },
+      );
+    }
 
     if (!this.cfg.responsive) {
       items.push(
@@ -9499,6 +9808,8 @@ if (this.plugin.settings.enableTextLayers && this.data) {
           ? "translate(-50%, -100%)"
           : "translate(-50%, 0)";
       }
+      
+      if (!this.cfg.displayOnly) {
 
       if (m.type !== "sticker") {
         host.addEventListener("mouseenter", (ev) =>
@@ -10002,6 +10313,7 @@ if (this.plugin.settings.enableTextLayers && this.data) {
 		  document.removeEventListener("keydown", keyClose, true);
 		});
       });
+      }
     }
   }
 

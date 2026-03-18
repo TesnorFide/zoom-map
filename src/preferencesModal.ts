@@ -14,7 +14,7 @@ export class PreferencesModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "Preferences" });
-	
+
     // Session image cache
     contentEl.createEl("h3", { text: "Session image cache" });
 
@@ -76,9 +76,10 @@ export class PreferencesModal extends Modal {
         });
         hybridToggle = toggle.toggleEl;
       });
-	  
-    // SVG raster quality (canvas)
-    contentEl.createEl("h3", { text: "Other preferences" });	
+
+    // Other preferences
+    contentEl.createEl("h3", { text: "Other preferences" });
+
     new Setting(contentEl)
       .setName("Show linked file name on hover")
       .setDesc("Shows the linked note’s filename inside the map tooltip. Useful when linked notes are still empty.")
@@ -88,7 +89,7 @@ export class PreferencesModal extends Modal {
           await this.plugin.saveSettings();
         });
       });
-	  
+
     new Setting(contentEl)
       .setName("Middle click pins opens linked note in new tab")
       .setDesc("When enabled: middle click on a pin opens its linked note in a new tab.")
@@ -98,7 +99,7 @@ export class PreferencesModal extends Modal {
           await this.plugin.saveSettings();
         });
       });
-	  
+
     new Setting(contentEl)
       .setName("Max SVG raster scale")
       .setDesc("Controls the maximum raster lod for SVG base images. Higher = sharper at high zoom, but more RAM and slower upgrades.")
@@ -109,8 +110,9 @@ export class PreferencesModal extends Modal {
         const cur = String(this.plugin.settings.svgRasterMaxScale ?? 8);
         d.setValue(cur);
         d.onChange(async (v) => {
-          const n = (Number(v) as 2 | 4 | 8);
-          this.plugin.settings.svgRasterMaxScale = (n === 2 || n === 4 || n === 8) ? n : 8;
+          const n = Number(v) as 2 | 4 | 8;
+          this.plugin.settings.svgRasterMaxScale =
+            n === 2 || n === 4 || n === 8 ? n : 8;
           await this.plugin.saveSettings();
         });
       });
@@ -134,7 +136,7 @@ export class PreferencesModal extends Modal {
           await this.plugin.saveSettings();
         });
       });
-	  
+
     new Setting(contentEl)
       .setName("Enable measure pro (terrain segments)")
       .setDesc("Allows assigning terrain factors per measurement segment for travel time.")
@@ -175,11 +177,46 @@ export class PreferencesModal extends Modal {
         });
       });
 
+    // Second screen integration
+    contentEl.createEl("h3", { text: "Second screen" });
+
+    let folderInput: HTMLInputElement | null = null;
+    const applySecondScreenState = () => {
+      const on = !!this.plugin.settings.enableSecondScreen;
+      if (folderInput) folderInput.disabled = !on;
+    };
+
+    new Setting(contentEl)
+      .setName("Enable second screen integration")
+      .setDesc('Enables "send to screen" integration with the plugin "ttrpg tools: screen display".')
+      .addToggle((toggle) => {
+        toggle.setValue(!!this.plugin.settings.enableSecondScreen).onChange(async (value) => {
+          this.plugin.settings.enableSecondScreen = value;
+          await this.plugin.saveSettings();
+          applySecondScreenState();
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("Second screen note folder")
+      .setDesc("Folder where temporary map notes and marker snapshots for the second screen are written.")
+      .addText((t) => {
+        t.setPlaceholder("Zoommap/secondscreen");
+        t.setValue(this.plugin.settings.secondScreenFolder ?? "ZoomMap/SecondScreen");
+        folderInput = t.inputEl;
+        t.onChange(async (v) => {
+          this.plugin.settings.secondScreenFolder =
+            v.trim() || "ZoomMap/SecondScreen";
+          await this.plugin.saveSettings();
+        });
+      });
+
     const footer = contentEl.createDiv({ cls: "zoommap-modal-footer" });
     const closeBtn = footer.createEl("button", { text: "Close" });
     closeBtn.onclick = () => this.close();
-	
-    applyEnabledState();	
+
+    applyEnabledState();
+    applySecondScreenState();
   }
 
   onClose(): void {

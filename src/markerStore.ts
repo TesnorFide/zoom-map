@@ -224,6 +224,14 @@ export interface MeasurementConfig {
   travelDayPresetId?: string;
 }
 
+export interface SecondScreenConfig {
+  markerLayerIds?: string[];
+  drawLayerIds?: string[];
+  textLayerIds?: string[];
+  notePath?: string;
+  markersPath?: string;
+}
+
 export interface MarkerFileData {
   /** Legacy field (deprecated): do not write anymore, still read for migration/back-compat */
   image?: string;
@@ -244,6 +252,8 @@ export interface MarkerFileData {
 
   drawLayers?: DrawLayer[];
   drawings?: Drawing[];
+  
+  secondScreen?: SecondScreenConfig;
   
   textLayers?: TextLayer[];
 }
@@ -325,6 +335,7 @@ export class MarkerStore {
       panClamp: true,
       drawLayers: [],
       drawings: [],
+      secondScreen: {},
 	  textLayers: [],
     };
 
@@ -412,6 +423,17 @@ export class MarkerStore {
   parsed.drawings ??= [];
   
   parsed.textLayers ??= [];
+  
+  parsed.secondScreen ??= {};
+  if (!Array.isArray(parsed.secondScreen.markerLayerIds)) delete parsed.secondScreen.markerLayerIds;
+  if (!Array.isArray(parsed.secondScreen.drawLayerIds)) delete parsed.secondScreen.drawLayerIds;
+  if (!Array.isArray(parsed.secondScreen.textLayerIds)) delete parsed.secondScreen.textLayerIds;
+  if (typeof parsed.secondScreen.notePath !== "string" || !parsed.secondScreen.notePath.trim()) {
+    delete parsed.secondScreen.notePath;
+  }
+  if (typeof parsed.secondScreen.markersPath !== "string" || !parsed.secondScreen.markersPath.trim()) {
+    delete parsed.secondScreen.markersPath;
+  }
 
   return parsed;
   }
