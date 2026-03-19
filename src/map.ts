@@ -637,6 +637,13 @@ export class MapInstance extends Component {
   private pinchStartDist = 0;
   private pinchPrevCenter: { x: number; y: number } | null = null;
 
+  private touchGestureCandidate = false;
+  private touchGestureLocked = false;
+  private touchGestureStartX = 0;
+  private touchGestureStartY = 0;
+  private readonly touchGestureLockThresholdPx = 8;
+  private readonly touchGestureEdgeGuardPx = 28;
+
   private currentBasePath: string | null = null;
 
   private frameSaveTimer: number | null = null;
@@ -2045,6 +2052,23 @@ export class MapInstance extends Component {
     this.registerDomEvent(window, "pointercancel", (e: PointerEvent) => {
       if (this.activePointers.has(e.pointerId)) this.activePointers.delete(e.pointerId);
       if (this.pinchActive && this.activePointers.size < 2) this.endPinch();
+    });
+	
+    const touchCaptureOpts: AddEventListenerOptions = {
+      passive: false,
+      capture: true,
+    };
+
+    this.viewportEl.addEventListener("touchstart", this.onNativeTouchStart, touchCaptureOpts);
+    this.viewportEl.addEventListener("touchmove", this.onNativeTouchMove, touchCaptureOpts);
+    this.viewportEl.addEventListener("touchend", this.onNativeTouchEnd, touchCaptureOpts);
+    this.viewportEl.addEventListener("touchcancel", this.onNativeTouchEnd, touchCaptureOpts);
+
+    this.register(() => {
+      this.viewportEl.removeEventListener("touchstart", this.onNativeTouchStart, touchCaptureOpts);
+      this.viewportEl.removeEventListener("touchmove", this.onNativeTouchMove, touchCaptureOpts);
+      this.viewportEl.removeEventListener("touchend", this.onNativeTouchEnd, touchCaptureOpts);
+      this.viewportEl.removeEventListener("touchcancel", this.onNativeTouchEnd, touchCaptureOpts);
     });
 
     this.registerDomEvent(this.viewportEl, "dblclick", (e: MouseEvent) => {
@@ -5145,6 +5169,109 @@ this.viewDragDist = 0;
   private mid(a: { x: number; y: number }, b: { x: number; y: number }): { x: number; y: number } {
     return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
   }
+  
+  private canUseNativeTouchCapture(): boolean {
+    if (!this.ready) return false;
+    if (this.cfg.responsive) return false;
+    return true;
+  }
+
+  private resetNativeTouchCapture(): void {
+    this.touchGestureCandidate = false;
+    this.touchGestureLocked = false;
+    this.touchGestureStartX = 0;
+    this.touchGestureStartY = 0;
+  }
+
+  private shouldIgnoreNativeTouchCapture(target: EventTarget | null): boolean {
+    const el = target instanceof Element ? target : null;
+    if (!el) return false;
+
+    return !!el.closest(
+      [
+        ".popover",
+        ".hover-popover",
+        ".zm-menu",
+        ".zm-submenu",
+        ".zm-tooltip",
+        ".suggestion-container",
+        ".modal",
+        "input",
+        "textarea",
+        "select",
+        "button",
+        ".zm-text-input",
+      ].join(", "),
+    );
+  }
+
+  private onNativeTouchStart = (e: TouchEvent): void => {
+    if (!this.canUseNativeTouchCapture()) return;
+    if (this.shouldIgnoreNativeTouchCapture(e.target)) return;
+    if (e.touches.length <= 0) return;
+
+    const first = e.touches[0];
+    const vpRect = this.viewportEl.getBoundingClientRect();
+    const x = first.clientX - vpRect.left;
+    const y = first.clientY - vpRect.top;
+
+    this.touchGestureStartX = x;
+    this.touchGestureStartY = y;
+    this.touchGestureCandidate = true;
+    this.touchGestureLocked = false;
+
+    const nearEdgeX =
+      x <= this.touchGestureEdgeGuardPx ||
+      x >= vpRect.width - this.touchGestureEdgeGuardPx;
+
+    if (e.touches.length >= 2 || nearEdgeX) {
+      this.touchGestureLocked = true;
+      this.touchGestureCandidate = false;
+      e.preventDefault();
+    }
+
+    e.stopPropagation();
+  };
+
+  private onNativeTouchMove = (e: TouchEvent): void => {
+    if (!this.canUseNativeTouchCapture()) return;
+    if (!this.touchGestureCandidate && !this.touchGestureLocked) return;
+    if (e.touches.length <= 0) {
+      this.resetNativeTouchCapture();
+      return;
+    }
+
+    const first = e.touches[0];
+
+    if (!this.touchGestureLocked) {
+      if (e.touches.length >= 2) {
+        this.touchGestureLocked = true;
+        this.touchGestureCandidate = false;
+      } else {
+        const vpRect = this.viewportEl.getBoundingClientRect();
+        const x = first.clientX - vpRect.left;
+        const y = first.clientY - vpRect.top;
+        const dx = x - this.touchGestureStartX;
+        const dy = y - this.touchGestureStartY;
+
+        if (Math.hypot(dx, dy) >= this.touchGestureLockThresholdPx) {
+          this.touchGestureLocked = true;
+          this.touchGestureCandidate = false;
+        }
+      }
+    }
+
+    if (this.touchGestureLocked) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  };
+
+  private onNativeTouchEnd = (e: TouchEvent): void => {
+    if (e.touches.length === 0) {
+      this.resetNativeTouchCapture();
+    }
+  };
 
   private onDblClickViewport(e: MouseEvent): void {
     if (!this.ready) return;

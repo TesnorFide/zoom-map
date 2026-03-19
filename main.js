@@ -4189,11 +4189,71 @@ var MapInstance = class extends import_obsidian19.Component {
     this.pinchStartScale = 1;
     this.pinchStartDist = 0;
     this.pinchPrevCenter = null;
+    this.touchGestureCandidate = false;
+    this.touchGestureLocked = false;
+    this.touchGestureStartX = 0;
+    this.touchGestureStartY = 0;
+    this.touchGestureLockThresholdPx = 8;
+    this.touchGestureEdgeGuardPx = 28;
     this.currentBasePath = null;
     this.frameSaveTimer = null;
     this.userResizing = false;
     this.yamlAppliedOnce = false;
     this.tintedSvgCache = /* @__PURE__ */ new Map();
+    this.onNativeTouchStart = (e) => {
+      if (!this.canUseNativeTouchCapture()) return;
+      if (this.shouldIgnoreNativeTouchCapture(e.target)) return;
+      if (e.touches.length <= 0) return;
+      const first = e.touches[0];
+      const vpRect = this.viewportEl.getBoundingClientRect();
+      const x = first.clientX - vpRect.left;
+      const y = first.clientY - vpRect.top;
+      this.touchGestureStartX = x;
+      this.touchGestureStartY = y;
+      this.touchGestureCandidate = true;
+      this.touchGestureLocked = false;
+      const nearEdgeX = x <= this.touchGestureEdgeGuardPx || x >= vpRect.width - this.touchGestureEdgeGuardPx;
+      if (e.touches.length >= 2 || nearEdgeX) {
+        this.touchGestureLocked = true;
+        this.touchGestureCandidate = false;
+        e.preventDefault();
+      }
+      e.stopPropagation();
+    };
+    this.onNativeTouchMove = (e) => {
+      if (!this.canUseNativeTouchCapture()) return;
+      if (!this.touchGestureCandidate && !this.touchGestureLocked) return;
+      if (e.touches.length <= 0) {
+        this.resetNativeTouchCapture();
+        return;
+      }
+      const first = e.touches[0];
+      if (!this.touchGestureLocked) {
+        if (e.touches.length >= 2) {
+          this.touchGestureLocked = true;
+          this.touchGestureCandidate = false;
+        } else {
+          const vpRect = this.viewportEl.getBoundingClientRect();
+          const x = first.clientX - vpRect.left;
+          const y = first.clientY - vpRect.top;
+          const dx = x - this.touchGestureStartX;
+          const dy = y - this.touchGestureStartY;
+          if (Math.hypot(dx, dy) >= this.touchGestureLockThresholdPx) {
+            this.touchGestureLocked = true;
+            this.touchGestureCandidate = false;
+          }
+        }
+      }
+      if (this.touchGestureLocked) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    this.onNativeTouchEnd = (e) => {
+      if (e.touches.length === 0) {
+        this.resetNativeTouchCapture();
+      }
+    };
     this.saveDataSoon = /* @__PURE__ */ (() => {
       let t = null;
       return () => new Promise((resolve) => {
@@ -5355,6 +5415,20 @@ ${(0, import_obsidian19.stringifyYaml)(yaml).trimEnd()}
     this.registerDomEvent(window, "pointercancel", (e) => {
       if (this.activePointers.has(e.pointerId)) this.activePointers.delete(e.pointerId);
       if (this.pinchActive && this.activePointers.size < 2) this.endPinch();
+    });
+    const touchCaptureOpts = {
+      passive: false,
+      capture: true
+    };
+    this.viewportEl.addEventListener("touchstart", this.onNativeTouchStart, touchCaptureOpts);
+    this.viewportEl.addEventListener("touchmove", this.onNativeTouchMove, touchCaptureOpts);
+    this.viewportEl.addEventListener("touchend", this.onNativeTouchEnd, touchCaptureOpts);
+    this.viewportEl.addEventListener("touchcancel", this.onNativeTouchEnd, touchCaptureOpts);
+    this.register(() => {
+      this.viewportEl.removeEventListener("touchstart", this.onNativeTouchStart, touchCaptureOpts);
+      this.viewportEl.removeEventListener("touchmove", this.onNativeTouchMove, touchCaptureOpts);
+      this.viewportEl.removeEventListener("touchend", this.onNativeTouchEnd, touchCaptureOpts);
+      this.viewportEl.removeEventListener("touchcancel", this.onNativeTouchEnd, touchCaptureOpts);
     });
     this.registerDomEvent(this.viewportEl, "dblclick", (e) => {
       if (this.cfg.responsive) return;
@@ -7829,6 +7903,37 @@ ${(0, import_obsidian19.stringifyYaml)(yaml).trimEnd()}
   }
   mid(a, b) {
     return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+  canUseNativeTouchCapture() {
+    if (!this.ready) return false;
+    if (this.cfg.responsive) return false;
+    return true;
+  }
+  resetNativeTouchCapture() {
+    this.touchGestureCandidate = false;
+    this.touchGestureLocked = false;
+    this.touchGestureStartX = 0;
+    this.touchGestureStartY = 0;
+  }
+  shouldIgnoreNativeTouchCapture(target) {
+    const el = target instanceof Element ? target : null;
+    if (!el) return false;
+    return !!el.closest(
+      [
+        ".popover",
+        ".hover-popover",
+        ".zm-menu",
+        ".zm-submenu",
+        ".zm-tooltip",
+        ".suggestion-container",
+        ".modal",
+        "input",
+        "textarea",
+        "select",
+        "button",
+        ".zm-text-input"
+      ].join(", ")
+    );
   }
   onDblClickViewport(e) {
     if (!this.ready) return;
