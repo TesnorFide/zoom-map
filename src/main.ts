@@ -117,6 +117,7 @@ const DEFAULT_SETTINGS: ZoomMapSettingsExtended = {
   wheelZoomFactor: 1.1,
   panMouseButton: "left",
   hoverMaxWidth: 360,
+  applyHoverPopoverSizeGlobally: false,
   hoverMaxHeight: 260,
   showLinkFileNameInTooltip: false,
   presets: [],
@@ -393,8 +394,47 @@ export default class ZoomMapPlugin extends Plugin {
     this.activeMap = inst;
   }
 
+  private clearGlobalHoverPopoverSettings(): void {
+    const root = document.documentElement;
+    const body = document.body;
+    if (!root || !body) return;
+
+    body.classList.remove("zm-global-hover-popover-size");
+
+    root.style.removeProperty("--zm-hover-popover-max-width");
+    root.style.removeProperty("--zm-hover-popover-max-height");
+    root.style.removeProperty("--popover-width");
+    root.style.removeProperty("--popover-height");
+    root.style.removeProperty("--popover-max-height");
+
+    body.style.removeProperty("--zm-hover-popover-max-width");
+    body.style.removeProperty("--zm-hover-popover-max-height");
+    body.style.removeProperty("--popover-width");
+    body.style.removeProperty("--popover-height");
+    body.style.removeProperty("--popover-max-height");
+  }
+
+  public applyGlobalHoverPopoverSettings(): void {
+    const root = document.documentElement;
+    const body = document.body;
+    if (!root || !body) return;
+
+    if (!this.settings.applyHoverPopoverSizeGlobally) {
+      this.clearGlobalHoverPopoverSettings();
+      return;
+    }
+
+    const maxW = Math.max(200, this.settings.hoverMaxWidth ?? 360);
+    const maxH = Math.max(120, this.settings.hoverMaxHeight ?? 260);
+
+    body.classList.add("zm-global-hover-popover-size");
+    root.style.setProperty("--zm-hover-popover-max-width", `${maxW}px`);
+    root.style.setProperty("--zm-hover-popover-max-height", `${maxH}px`);
+  }
+
   async onload(): Promise<void> {
     await this.loadSettings();
+	this.applyGlobalHoverPopoverSettings();
     this.applyImageCacheSettings();
 	
 	this.addCommand({
@@ -723,6 +763,7 @@ export default class ZoomMapPlugin extends Plugin {
   }
   
   onunload(): void {
+	this.clearGlobalHoverPopoverSettings();
     this.imageCache?.clear();
     this.imageCache = null;
   }
@@ -804,6 +845,7 @@ export default class ZoomMapPlugin extends Plugin {
 	this.settings.enableTextLayers ??= false;
 	this.settings.enableMeasurePro ??= false;
 	this.settings.showLinkFileNameInTooltip ??= false;
+	this.settings.applyHoverPopoverSizeGlobally ??= false;
 	
     this.settings.enableSessionImageCache ??= false;
     this.settings.sessionImageCacheMb ??= 512;
@@ -824,6 +866,7 @@ export default class ZoomMapPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+	this.applyGlobalHoverPopoverSettings();
     this.applyImageCacheSettings();
   }
   
@@ -1331,6 +1374,12 @@ class ZoomMapSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Hover popover size")
       .setDesc("Max width and height in pixels.")
+      .addToggle((tg) =>
+        tg.setValue(!!this.plugin.settings.applyHoverPopoverSizeGlobally).onChange((v) => {
+          this.plugin.settings.applyHoverPopoverSizeGlobally = v;
+          void this.plugin.saveSettings();
+        }),
+      )
       .addText((t) =>
         t
           .setPlaceholder("360")
